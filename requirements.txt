@@ -1,0 +1,14 @@
+asyncpg
+bcrypt
+fastapi
+python-jose[cryptography]
+pydantic
+pydantic-settings
+python-dotenv
+redis
+httpx
+loguru
+lxml
+sqlalchemy
+python-multipart
+uvicorn
