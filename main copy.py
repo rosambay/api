@@ -3,12 +3,11 @@ import redis.asyncio as Redis
 import database
 import redis_client
 import json
-from datetime import date, datetime
 import models, schemas
 from auth import get_password_hash, verify_password, create_access_token
 from database import engine, Base, SessionLocal, get_db
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import Column, Integer, text 
+from sqlalchemy import Column, text 
 from sqlalchemy.orm import aliased
 from sqlalchemy.future import select
 from fastapi import FastAPI, Depends, HTTPException, status,  Response, Request, Query, Form
@@ -22,29 +21,6 @@ from contextlib import asynccontextmanager
 from config import settings
 from tools import  getJobStatusMatrix, getJobTypeMatrix, getPlaceMatrix, getResourceWindowMatrix, getStyleMetrix, getResourcesMatrix, getTeamMatrix ,getUserSession, getJobsMatrix, getGeoPosMatrix, setUserSession, getTeamMemberMatrix,getLogInOutMatrix, getAdressMatrix
 from loguru import logger
-import httpx
-
-async def get_route_distance(coordinates: List[List[float]]) -> dict:
-    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
-    url = f"https://routes.imagineit.com.br/routes/route/v1/driving/{coords_str}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(url, params={"overview": "false"})
-        response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise ValueError(f"OSRM retornou erro: {data.get('code')}")
-
-    distance_meters = data["routes"][0]["distance"]
-    distance_time = data["routes"][0]["duration"]
-    return {
-        "distance_meters": distance_meters,
-        "distance_km": round(distance_meters / 1000, 3),
-        "distance_time": distance_time,
-        "distance_time_minutes": round(distance_time / 60, 2)
-    }
 
 async def cleanSessionsRedis(r: Redis,session_web_id: str):
     # await r.delete(f"session:{session_web_id}")
@@ -146,30 +122,24 @@ async def getResources(r):
                               name text,
                               geocode_lat text, 
                               geocode_long text, 
-                              geocode_lat_from text,
-                              geocode_long_from text,
-                              geocode_lat_at text,
-                              geocode_long_at text,
                               modified_dttm TIMESTAMP,
                               last_snap TIMESTAMP)) AS t
                   ON u.client_id = :client_id AND u.client_resource_id = t.person_id
                   WHEN MATCHED AND (  
-                                 u.actual_geocode_lat IS DISTINCT FROM t.geocode_lat 
-                              OR u.actual_geocode_long IS DISTINCT FROM t.geocode_long 
-                              OR u.geocode_lat_from IS DISTINCT FROM t.geocode_lat_from
-                              OR u.geocode_long_from IS DISTINCT FROM t.geocode_long_from
-                              OR u.geocode_lat_at IS DISTINCT FROM t.geocode_lat_at
-                              OR u.geocode_long_at IS DISTINCT FROM t.geocode_long_at
+                                 u.res_geocode_lat IS DISTINCT FROM t.geocode_lat 
+                              OR u.res_geocode_long IS DISTINCT FROM t.geocode_long 
                               OR u.description IS DISTINCT FROM t.name 
                               )  THEN
-                      UPDATE SET actual_geocode_lat = t.geocode_lat 
-                          ,actual_geocode_long = t.geocode_long 
+                      UPDATE SET res_geocode_lat = t.geocode_lat 
+                          ,res_geocode_long = t.geocode_long 
+                          ,actual_geocode_lat = t.geocode_lat
+                          ,actual_geocode_long = t.geocode_long
                           ,description = t.name
                           ,modified_by = 'INTEGRATION'
                           ,modified_date = t.modified_dttm 
                   WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_resource_id, description, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date) 
-                      VALUES (:client_id, t.person_id, t.name, t.geocode_lat, t.geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                      INSERT (client_id,client_resource_id, description, res_geocode_lat, res_geocode_long, actual_geocode_lat, actual_geocode_long, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date) 
+                      VALUES (:client_id, t.person_id, t.name, t.geocode_lat, t.geocode_long, t.geocode_lat, t.geocode_long, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
                   RETURNING 
                        u.resource_id, merge_action(), to_jsonb(u) AS registro_json
               """)
@@ -510,19 +480,13 @@ async def getTeam(r):
                             AS x(
                               team_id text, 
                               description text,
-                              geocode_lat text, 
-                              geocode_long text,
                               modified_dttm TIMESTAMP,
                               last_snap TIMESTAMP)) AS t
                   ON u.client_id = :client_id AND u.client_team_id = t.team_id
                   WHEN MATCHED AND (  
                               u.team_name IS DISTINCT FROM t.description 
-                              OR u.geocode_lat IS DISTINCT FROM t.geocode_lat
-                              OR u.geocode_long IS DISTINCT FROM t.geocode_long
                               )  THEN
                       UPDATE SET team_name = t.description
-                          ,geocode_lat = t.geocode_lat
-                          ,geocode_long = t.geocode_long
                           ,modified_by = 'INTEGRATION'
                           ,modified_date = t.modified_dttm 
                   RETURNING 
@@ -555,7 +519,7 @@ async def getTeamMember(r):
     dateTime = oneHour(dateTime)
 
     result_rows = await getTeamMemberMatrix( dateTime, settings.client_uid)
-
+    print(result_rows)
     if result_rows:
           last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
           try:
@@ -926,21 +890,12 @@ async def getJobs(r):
                               task_status text,
                               created_dttm TIMESTAMP,
                               modified_dttm TIMESTAMP,
-                              work_duration NUMERIC,
                               plan_start_dttm TIMESTAMP,
                               plan_end_dttm TIMESTAMP,
                               actual_start_dttm TIMESTAMP,
                               actual_end_dttm TIMESTAMP,
                               sla TIMESTAMP,
                               plan_task_dur_min integer,
-                              pp_person_id text,
-                              pp_actual_start_dttm TIMESTAMP,
-                              pp_actual_end_dttm TIMESTAMP,
-                              pt_task_id text,
-                              pt_actual_start_dttm TIMESTAMP,
-                              pt_actual_end_dttm TIMESTAMP,
-                              pt_geocode_lat text,
-                              pt_geocode_long text,
                               last_snap TIMESTAMP)
                       LEFT JOIN resources r ON x.person_id = r.client_resource_id AND :client_id = r.client_id
                       JOIN teams t ON t.client_team_id = x.team_id AND t.client_id = :client_id
@@ -951,14 +906,13 @@ async def getJobs(r):
                       ) AS t
               ON u.client_id = :client_id AND u.client_job_id = t.client_job_id
               WHEN MATCHED AND (  
-                             u.team_id IS DISTINCT FROM t.team_idd 
+                              u.team_id IS DISTINCT FROM t.team_idd 
                           OR u.resource_id IS DISTINCT FROM t.resource_id 
                           OR u.address_id IS DISTINCT FROM t.address_idd 
                           OR u.place_id IS DISTINCT FROM t.place_idd 
                           OR u.job_type_id IS DISTINCT FROM t.job_type_id 
                           OR u.job_status_id IS DISTINCT FROM t.job_status_id 
                           OR u.created_date IS DISTINCT FROM t.created_dttm 
-                          OR u.actual_work_duration IS DISTINCT FROM t.work_duration::INTEGER
                           OR u.plan_start_date IS DISTINCT FROM t.plan_start_dttm 
                           OR u.plan_end_date IS DISTINCT FROM t.plan_end_dttm 
                           OR u.actual_start_date IS DISTINCT FROM t.actual_start_dttm 
@@ -966,14 +920,6 @@ async def getJobs(r):
                           OR u.time_limit_end IS DISTINCT FROM t.sla 
                           OR u.time_limit_start IS DISTINCT FROM t.plan_start_dttm 
                           OR u.time_service IS DISTINCT FROM t.plan_task_dur_min 
-                          OR u.pp_resource_id IS DISTINCT FROM t.pp_person_id 
-                          OR u.pp_start_date IS DISTINCT FROM t.pp_actual_start_dttm
-                          OR u.pp_end_date IS DISTINCT FROM t.pp_actual_end_dttm
-                          OR u.pt_job_id IS DISTINCT FROM t.pt_task_id
-                          OR u.pt_start_date IS DISTINCT FROM t.pt_actual_start_dttm
-                          OR u.pt_end_date IS DISTINCT FROM t.pt_actual_end_dttm
-                          OR u.pt_geocode_lat IS DISTINCT FROM t.pt_geocode_lat
-                          OR u.pt_geocode_long IS DISTINCT FROM t.pt_geocode_long
                           ) THEN
                   UPDATE SET team_id = t.team_idd 
                       ,resource_id = t.resource_id 
@@ -981,7 +927,7 @@ async def getJobs(r):
                       ,place_id = t.place_idd
                       ,job_type_id = t.job_type_id 
                       ,job_status_id = t.job_status_id 
-                      ,actual_work_duration = t.work_duration::INTEGER
+                      ,modified_date = t.modified_dttm 
                       ,plan_start_date = t.plan_start_dttm 
                       ,plan_end_date = t.plan_end_dttm 
                       ,actual_start_date = t.actual_start_dttm 
@@ -989,18 +935,9 @@ async def getJobs(r):
                       ,time_limit_end = t.sla
                       ,time_limit_start = t.plan_start_dttm
                       ,time_service = t.plan_task_dur_min
-                      ,pp_resource_id = t.pp_person_id
-                      ,pp_start_date = t.pp_actual_start_dttm
-                      ,pp_end_date = t.pp_actual_end_dttm
-                      ,pt_job_id = t.pt_task_id
-                      ,pt_start_date = t.pt_actual_start_dttm
-                      ,pt_end_date = t.pt_actual_end_dttm
-                      ,pt_geocode_lat = t.pt_geocode_lat
-                      ,pt_geocode_long = t.pt_geocode_long
-                      ,modified_date = t.modified_dttm 
               WHEN NOT MATCHED THEN
-                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, actual_work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, created_by, created_date, modified_by, modified_date) 
-                  VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, t.pp_person_id, t.pp_actual_start_dttm, t.pp_actual_end_dttm, t.pt_task_id, t.pt_actual_start_dttm, t.pt_actual_end_dttm, t.pt_geocode_lat, t.pt_geocode_long, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, created_by, created_date, modified_by, modified_date) 
+                  VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
               RETURNING 
                   to_jsonb(u) AS registro_json, merge_action(), u.job_id
           """)
@@ -1013,16 +950,13 @@ async def getJobs(r):
                 # await criar_e_enviar_notificacao(r, type=type, titulo="Chamado Alterado", dados_extra=row.registro_json)
                 logger.info(f"ID: {row.job_id} | Ação JOB realizada: {row.merge_action}")
           
-          # stmt = text(f""" """)
-          # async with SessionLocal() as db:
-            
           await r.set(snapKey, last_snap)
       except Exception as e:
                 logger.error(f"[getJobs] Erro ao processar postgres: {e}")
     return
 
 async def processo_em_background(r):
-    SLEEP_NORMAL = 30
+    SLEEP_NORMAL = 10
     SLEEP_MAX = 300
     consecutive_failures = 0
 
@@ -1039,11 +973,11 @@ async def processo_em_background(r):
                 await asyncio.sleep(0.2)
                 await getLogInOut(r)
                 await asyncio.sleep(0.2)
+                await getTeamMember(r)
+                await asyncio.sleep(0.2)
                 await getJobs(r)
                 await asyncio.sleep(0.2)
                 await getTeam(r)
-                await asyncio.sleep(0.2)
-                await getTeamMember(r)
                 await asyncio.sleep(0.2)
                 await getAddress(r)
                 await asyncio.sleep(0.2)
@@ -1120,33 +1054,9 @@ async def lifespan(app: FastAPI):
             db.add(newUser)
             await db.commit()
 
-        # # Cria um usuário relacionado ao time
-        # rUserTeam = await db.execute(select(models.UserTeam).where(models.UserTeam.user_id == 1))
-        # userTeamDb = rUserTeam.scalars().first()
-        
-        # if not userTeamDb:
-        #     rTeamT = await db.execute(select(models.Teams).where(models.Teams.client_team_id == '48898'))
-        #     teamTDb = rTeamT.scalars().first()
-
-        #     print("Criando usuário 'admin' para o time ... ", teamTDb.team_id)
-            
-        #     newUser = models.UserTeam(
-        #         client_id = 1,
-        #         user_id = 1,
-        #         team_id = teamTDb.team_id,
-        #         created_by = "admin",
-        #         created_date = datetime.now(),
-        #         modified_by = "admin",
-        #         modified_date = datetime.now()
-        #     )
-        #     db.add(newUser)
-        #     await db.commit()
-
     r = redis_client.get_redis()
-
     # await r.flushall()
     # logger.info("Cache Redis limpo com sucesso!")
-
     job = asyncio.create_task(processo_em_background(r))
     yield
         
@@ -1203,7 +1113,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         dataToken = {
             "clientId": payload.get("clientId"),
             "userId": payload.get("userId"),
-            "userName": payload.get("userName"),
             "superUser": payload.get("superUser"),
             "clientUid": payload.get("clientUid"),
             "clientDomain": payload.get("clientDomain")
@@ -1257,7 +1166,6 @@ async def login(form_data: schemas.LoginRequest, request: Request, r: Redis = De
 
     dataToken = {
         "userId": userDb.user_id,
-        "userName": userDb.user_name,
         "superUser": superUser,
         "clientId": clientId,
         "clientUid": str(clientUid),
@@ -1367,12 +1275,10 @@ async def getResourcesTree(
             uid as resource_uid,
             client_resource_id,
             description,
+            res_geocode_lat,
+            res_geocode_long,
             actual_geocode_lat,
             actual_geocode_long,
-            geocode_lat_from,
-            geocode_long_from,
-            geocode_lat_at,
-            geocode_long_at,
             logged_in,
             logged_out,
             modified_date
@@ -1396,7 +1302,7 @@ async def getResourcesTree(
                             
         result = await db.execute(smtp)
         rows = result.mappings().all()
-        print(type(rows))
+        
         arvore = [dict(row) for row in rows]
         return arvore
         
@@ -1406,399 +1312,77 @@ async def getResourcesTree(
 
 @app.get("/jobs")
 async def getJobsResources(
-    pdate: str = Query(..., description="Data no formato YYYY-MM-DD"),
-    simulate_board: Optional[bool] = Query(None, description="Simular quadro de tarefas para a data especificada"),
-    simulate_plan_date: Optional[bool] = Query(None, description="Simular data de plano para a data especificada"),
-    resources: Optional[str] = Query(None, description="Simular um recurso para a data especificada"),
+    date: str = Query(..., description="Data no formato YYYY-MM-DD"),
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    
-    userId = current_user["userId"]
-    userName = current_user["userName"]
-    clientId = current_user["clientId"]
+    user_id = current_user["userId"]
+    client_id = current_user["clientId"]
 
-    if simulate_board and simulate_plan_date:
-      raise HTTPException(status_code=404, detail="Só pode ser feito um tipo de simulação por vez: quadro de tarefas (simulate_board) ou data de plano (simulate_plan_date).")
-      
-    if not simulate_board and not simulate_plan_date:
-      try:
-          # Tenta executar uma query simples no banco
-          smtp = text("""
-            select 
-              'ORIGIN' as type,
-              j.job_id,
-              j.client_job_id,
-              j.team_id, 
-              j.resource_id, 
-              r.client_resource_id,
-              j.job_status_id, 
-              js.description AS status_description,
-              js.internal_code_status,
-              js.style_id,
-              j.job_type_id, 
-              jt.description as type_description,
-              j.address_id, 
-              a.client_address_id, 
-              a.geocode_lat, 
-              a.geocode_long, 
-              a.address, 
-              a.city, 
-              a.state_prov, 
-              a.zippost, 
-              a.time_setup,
-              p.trade_name, 
-              p.cnpj,
-              j.time_setup, 
-              j.time_service, 
-              j.plan_start_date, 
-              j.plan_end_date, 
-              j.actual_start_date, 
-              j.actual_end_date, 
-              CASE WHEN j.actual_start_date is not null then j.actual_start_date else j.plan_start_date end as start_date,
-              CASE WHEN j.actual_end_date is not null then j.actual_end_date else j.plan_end_date end as start_date,
-              j.time_limit_start, 
-              j.time_limit_end
-              from jobs j
-              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              where ut.client_id = :client_id
-                and ut.user_id = :user_id
-                and (
-                      (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
-                    or (
-                      j.actual_start_date is not null AND (j.actual_start_date >= cast(:p_date as date) and j.actual_start_date < cast(:p_date as date) + interval '1 day')
-                      )
+    try:
+        # Tenta executar uma query simples no banco
+        smtp = text("""
+          select 
+            j.job_id,
+            j.client_job_id,
+            j.team_id, 
+            j.resource_id, 
+            r.client_resource_id,
+            j.job_status_id, 
+            js.description AS status_description,
+            js.internal_code_status,
+            js.style_id,
+            j.job_type_id, 
+            jt.description as type_description,
+            j.address_id, 
+            a.client_address_id, 
+            a.geocode_lat, 
+            a.geocode_long, 
+            a.address, 
+            a.city, 
+            a.state_prov, 
+            a.zippost, 
+            a.time_setup,
+            p.trade_name, 
+            p.cnpj,
+            j.time_setup, 
+            j.time_service, 
+            j.plan_start_date, 
+            j.plan_end_date, 
+            j.actual_start_date, 
+            j.actual_end_date, 
+            CASE WHEN j.actual_start_date is not null then j.actual_start_date else j.plan_start_date end as start_date,
+            CASE WHEN j.actual_end_date is not null then j.actual_end_date else j.plan_end_date end as start_date,
+            j.time_limit_start, 
+            j.time_limit_end
+            from jobs j
+            join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
+            join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+            join teams t on t.client_id = j.client_id and t.team_id = j.team_id
+            join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
+            join address a on a.client_id = j.client_id and a.address_id = j.address_id
+            join places p on p.client_id = j.client_id and p.place_id = j.place_id
+            left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
+            where ut.client_id = :client_id
+              and ut.user_id = :user_id
+              and (
+                    (j.actual_start_date is null and j.plan_start_date >= cast(:date as date) and j.plan_start_date < cast(:date as date) + interval '1 day')
+                   or (
+                    j.actual_start_date is not null AND (j.actual_start_date >= cast(:date as date) and j.actual_start_date < cast(:date as date) + interval '1 day')
                     )
-              order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
-          """).bindparams(client_id=clientId, user_id=userId, p_date=pdate)
-                              
-          result = await db.execute(smtp)
-          rows = result.mappings().all()
+                  )
+            order by j.plan_start_date desc
+        """).bindparams(client_id=client_id, user_id=user_id, date=date)
+                            
+        result = await db.execute(smtp)
+        rows = result.mappings().all()
 
-          res = [dict(row) for row in rows]
-          return res
-          
-      except Exception as e:
-          logger.error(f"Erro ao conectar no banco: {e}")
-          raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
-    
-    if simulate_board:
-      rSimulation = await db.execute(select(models.Simulation).where(models.Simulation.client_id == clientId, models.Simulation.user_id == userId).order_by(models.Simulation.sequence.desc()))
-      simulationDb = rSimulation.scalars().first()
-      print("Simulando data de plano para: ", pdate)
-      newSimulation = models.Simulation(
-                client_id = clientId,
-                user_id = userId,
-                sequence = (simulationDb.sequence + 1) if simulationDb else 1,
-                simulation_date = date.fromisoformat(pdate),
-                fl_calc_board = 1,
-                created_by = userName,
-                created_date = datetime.now(),
-                modified_by = userName,
-                modified_date = datetime.now()
-            )
-      db.add(newSimulation)
-      await db.commit()
-
-      await db.refresh(newSimulation) 
-      
-      simulationId = newSimulation.simulation_id
-
-      ## Fazemos o for para criar as tarefas simuladas
-      smtp = text(f"""
-        select a.*,
-          EXTRACT(EPOCH FROM 
-            case 
-                when a.pt_end_date is null 
-                  then 
-                    a.actual_start_date - a.start_day
-                else 
-                  a.actual_start_date - a.pt_end_date
-              end )::INTEGER AS actual_time_arrived
-        from (
-        select 
-              js.description AS status_description,
-              j.team_id, 
-              j.job_id,
-              j.client_job_id,
-              t.client_team_id,
-              j.resource_id,
-              j.job_status_id,
-              j.job_type_id,
-              j.address_id,
-              j.place_id,
-              r.client_resource_id,
-              j.actual_start_date,
-              j.actual_end_date,
-              a.geocode_lat,
-              a.geocode_long,
-              j.time_setup,
-              j.time_service,
-              J.time_limit_start,
-              J.time_limit_end,
-              j.actual_work_duration * 60 as actual_work_duration,
-              EXTRACT(ISODOW FROM j.actual_start_date) week_day,
-              CASE 
-                WHEN j.pt_geocode_lat is null
-                  THEN r.geocode_lat_from
-                ELSE
-                  j.pt_geocode_lat
-              END AS geocode_lat_before,
-              CASE 
-                WHEN j.pt_geocode_long is null
-                  THEN r.geocode_long_from
-                ELSE
-                  j.pt_geocode_long
-              END AS geocode_long_before,
-              EXTRACT(EPOCH FROM (j.actual_end_date - j.actual_start_date) )::INTEGER AS actual_time_service,
-              j.time_service * 60 AS time_service,
-              j.pt_job_id,
-              cast(j.actual_start_date as date) + rw.start_time AS start_day,
-              cast(j.actual_start_date as date) + rw.end_time AS end_day,
-              j.pt_end_date
-              from jobs j
-              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              join resource_windows rw on rw.client_id = j.client_id and rw.resource_id = j.resource_id and rw.week_day = EXTRACT(ISODOW FROM j.actual_start_date)
-              where ut.client_id = :client_id
-                and ut.user_id = :user_id
-                and j.actual_start_date >= cast(:date as date) and j.actual_start_date < cast(:date as date) + interval '1 day'
-               and j.resource_id in ({resources})
-               and js.internal_code_status = 'CONCLU'
-              order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
-        ) as a
-      """).bindparams(client_id=clientId, user_id=userId, date=pdate)
-      result = await db.execute(smtp)
-      rows = result.mappings().all()
-      rId = None
-      rDtStartReal = None
-      rDtEndReal = None
-      rDtStartWindow = None
-      rDtEndWindow = None
-      rWorkDurationTotal = 0
-      rWorkDurationSimulado = 0
-      rOrder = 1
-      for row in rows:
-          if rId != row.resource_id:
-            print('-----------------------------')
-            print('Recurso: ', row.client_resource_id)
-            rId = row.resource_id
-            rDtStartReal = row.start_day
-            rDtStartWindow = row.start_day
-
-          minhas_coordenadas = [
-              [row.geocode_long_before, row.geocode_lat_before],
-              [row.geocode_long, row.geocode_lat]
-          ]
-          retorno = await get_route_distance(minhas_coordenadas)
-          distance = round(retorno['distance_meters'])
-          timeDistance = round(retorno['distance_time'])      
-          # print('Distance: ', distance)
-          # print('Tempo  : ', timeDistance)
-          # print('Tempo Atual  : ', row.actual_time_arrived)
-          # print('Tempo de Serviço Atual : ', row.actual_time_service)
-          # print('Tempo Janela de Serviço  : ', row.time_service)
-          # print('Data e hora Iniciou  : ', row.actual_start_date)
-          rDtStartReal = rDtStartReal + timedelta(seconds=timeDistance)
-          rDtEndReal = rDtStartReal + timedelta(seconds=row.actual_time_service)
-          rDtStartWindow = rDtStartWindow + timedelta(seconds=timeDistance)
-          rDtEndWindow = rDtStartWindow + timedelta(seconds=row.time_service)
-          rSimulatedWorkDuration = (row.actual_time_service or 0) + (timeDistance or 0)
-          print('Data e hora Simulada Inicio  : ', rDtStartReal)
-          print('Data e hora Simulada Janela Inicio  : ', rDtStartWindow)
-          print('Data e hora Iniciou  : ', row.actual_start_date)
-          print('Data e hora Simulada Fim  : ', rDtEndReal)
-          print('Data e hora Simulada Janela Fim  : ', rDtEndWindow)
-          print('Data e hora Fim  : ', row.actual_end_date)
-          print('Work Duration  : ', row.actual_work_duration)
-          print('Work Duration Simulado  : ', rSimulatedWorkDuration)
-          rWorkDurationTotal = rWorkDurationTotal + (row.actual_work_duration or 0)
-          rWorkDurationSimulado = rWorkDurationSimulado + (row.actual_time_service or 0) + (timeDistance or 0)
-          # insere on banco e muda a data Start
-          newSimulationJobs = models.SimulationJobs(
-                client_id = clientId,
-                simulation_id = simulationId,
-                job_id = row.job_id,
-                client_job_id = row.client_job_id,
-                team_id  = row.team_id,
-                resource_id  = row.resource_id,
-                job_status_id  = row.job_status_id,
-                job_type_id  = row.job_type_id,
-                address_id = row.address_id,
-                place_id  = row.place_id,
-                time_setup = row.time_setup,
-                default_time_service = row.time_service,
-                actual_time_service = row.actual_time_service,
-                actual_work_duration = row.actual_work_duration,
-                simulated_work_duration = rSimulatedWorkDuration,
-                actual_start_date = row.actual_start_date,
-                actual_end_date = row.actual_end_date,
-                simulated_start_date = rDtStartReal,
-                simulated_end_date = rDtEndReal,
-                simulated_window_start_date = rDtStartWindow,
-                simulated_window_end_date = rDtEndWindow,
-                time_limit_start = row.time_limit_start,
-                time_limit_end = row.time_limit_end,
-                order = rOrder,
-                actual_distance = distance,
-                simulated_distance = distance,
-                actual_time_distance = row.actual_time_arrived,
-                simulated_time_distance = timeDistance,
-                created_by = userName,
-                created_date = datetime.now(),
-                modified_by = userName,
-                modified_date = datetime.now()
-          )
-          db.add(newSimulationJobs)
-          await db.commit()
-          rDtStartReal = rDtEndReal
-          rDtStartWindow = rDtEndWindow
-          rOrder = rOrder + 1
-          #           # print("Tempo de deslocamento estimado (em minutos): ", retorno, ' - ', row.actual_time_arrived)
-      print('Work Duration Total  : ', rWorkDurationTotal)
-      print('Work Duration Simulado  : ', rWorkDurationSimulado)    
-
-      
-      smtp = text(f"""
-        select * from (
-            select 
-              'ORIGIN' as type,
-              j.job_id,
-              j.client_job_id,
-              j.team_id, 
-              j.resource_id, 
-              r.client_resource_id,
-              j.job_status_id, 
-              js.description AS status_description,
-              js.internal_code_status,
-              js.style_id,
-              j.job_type_id, 
-              jt.description as type_description,
-              j.address_id, 
-              a.client_address_id, 
-              a.geocode_lat, 
-              a.geocode_long, 
-              a.address, 
-              a.city, 
-              a.state_prov, 
-              a.zippost, 
-              a.time_setup,
-              p.trade_name, 
-              p.cnpj,
-              j.time_setup, 
-              j.time_service, 
-              j.plan_start_date, 
-              j.plan_end_date, 
-              j.actual_start_date, 
-              j.actual_end_date, 
-              CASE WHEN j.actual_start_date is not null then j.actual_start_date else j.plan_start_date end as start_date,
-              CASE WHEN j.actual_end_date is not null then j.actual_end_date else j.plan_end_date end as start_date,
-              j.time_limit_start, 
-              j.time_limit_end,
-              null AS actual_time_service,
-              null AS actual_work_duration,
-              null AS simulated_work_duration,
-              null AS simulated_start_date,
-              null AS simulated_end_date,
-              null AS simulated_window_start_date,
-              null AS simulated_window_end_date,
-              null AS actual_distance,
-              null AS simulated_distance,
-              null AS actual_time_distance,
-              null AS simulated_time_distance
-              from jobs j
-              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              where ut.client_id = :client_id
-                and ut.user_id = :user_id
-                and j.resource_id IN ({resources})
-                and (
-                      (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
-                    or (
-                      j.actual_start_date is not null AND (j.actual_start_date >= cast(:p_date as date) and j.actual_start_date < cast(:p_date as date) + interval '1 day')
-                      )
-                    )
-              union all
-            select 
-              'SIMULATED' as type,
-              j.job_id,
-              j.client_job_id,
-              j.team_id, 
-              j.resource_id, 
-              r.client_resource_id,
-              j.job_status_id, 
-              js.description AS status_description,
-              js.internal_code_status,
-              js.style_id,
-              j.job_type_id, 
-              jt.description as type_description,
-              j.address_id, 
-              a.client_address_id, 
-              a.geocode_lat, 
-              a.geocode_long, 
-              a.address, 
-              a.city, 
-              a.state_prov, 
-              a.zippost, 
-              a.time_setup,
-              p.trade_name, 
-              p.cnpj,
-              j.time_setup,
-              j.default_time_service as time_service, 
-              j.actual_start_date AS plan_start_date, 
-              j.actual_end_date AS plan_end_date, 
-              j.actual_start_date, 
-              j.actual_end_date, 
-              j.actual_start_date as start_date,
-              j.actual_end_date as end_date,
-              j.time_limit_start, 
-              j.time_limit_end,
-              j.actual_time_service,
-              j.actual_work_duration,
-              j.simulated_work_duration,
-              j.simulated_start_date,
-              j.simulated_end_date,
-              j.simulated_window_start_date,
-              j.simulated_window_end_date,
-              j.actual_distance,
-              j.simulated_distance,
-              j.actual_time_distance,
-              j.simulated_time_distance
-              from simulation_jobs j
-              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              where j.client_id = :client_id
-                and j.simulation_id = :simulation_id
-              )
-        order by team_id, resource_id nulls last,actual_start_date nulls last, plan_start_date, type
-      """).bindparams(client_id=clientId, user_id=userId, p_date=pdate, simulation_id = simulationId)
-                          
-      result = await db.execute(smtp)
-      rows = result.mappings().all()
-
-      res = [dict(row) for row in rows]
-      return res
-      
+        res = [dict(row) for row in rows]
+        return res
+        
+    except Exception as e:
+        logger.error(f"Erro ao conectar no banco: {e}")
+        raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
 
 @app.get("/tasks/")
 async def read_tasks(
@@ -2073,5 +1657,5 @@ async def events_endpoint(
 
 #         r_uid = await criar_e_enviar_notificacao(r, type='GEO', titulo="Chamado Alterado", dados_extra=person)
 #         r_uid = await criar_e_enviar_notificacao(r, type='LOGIN', titulo="Chamado Alterado", dados_extra=person)
-
+           
 #     return {"status": "Enviado", "target": r_uid}

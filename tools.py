@@ -749,6 +749,7 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     t.cnpj,
                     t.created_dttm, 
                     t.modified_dttm,
+                    t.work_duration,
                     t.plan_start_dttm,
                     t.plan_end_dttm,
                     t.plan_task_dur_min,
@@ -766,8 +767,17 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     t.team_modified_dttm,
                     t.place_modified_dttm,
                     t.task_type_modified_dttm,
-                    t.task_status_modified_dttm
-                    FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
+                    t.task_status_modified_dttm,
+                    pp.pp_person_id,
+                    pp.pp_actual_start_dttm,
+                    pp.pp_actual_end_dttm,
+                    pp.pt_task_id,
+                    pp.pt_actual_start_dttm,
+                    pp.pt_actual_end_dttm,
+                    pp.pt_geocode_lat,
+                    pp.pt_geocode_long                   
+               FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
+               JOIN dbo.c_task_routes_preview_task_vw pp on pp.task_id = t.task_id
                     LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
 						       WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
                  ORDER BY t.modified_dttm ASC 
@@ -825,13 +835,22 @@ async def getResourcesMatrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-            select person_id, 
-            concat(first_name,COALESCE(middle_name,' '),last_name) AS name,
-            geocode_lat, geocode_long, modified_dttm, max(modified_dttm)  OVER (PARTITION BY 1)  last_snap
-              from C_PERSON_VW WITH (NOEXPAND)
-            where modified_dttm >= CAST('{dateTime}' AS datetime)
-              and person_type = 'TECNICO'
-            order by modified_dttm desc
+            select 
+                p.person_id, 
+                concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS name,
+                p.geocode_lat, 
+                p.geocode_long, 
+                pg.geocode_lat_from,
+                pg.geocode_long_from, 
+                pg.geocode_lat_at, 
+                pg.geocode_long_at,
+                p.modified_dttm, 
+                max(p.modified_dttm)  OVER (PARTITION BY 1)  last_snap
+              from C_PERSON_VW p WITH (NOEXPAND)
+              LEFT JOIN c_person_geocode_vw pg ON p.person_id = pg.person_id
+            where p.modified_dttm >= CAST('{dateTime}' AS datetime)
+              and p.person_type = 'TECNICO'
+            order by p.modified_dttm desc
             """)
         await client.close()
 
@@ -1107,11 +1126,19 @@ async def getTeamMatrix(dateTime: str = None, client_uid: str = None):
 # Recuperando o valor
 
         app_params_response = await client.execute_query(f"""
-            SELECT team_id, description, modified_dttm, 
-                  MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-             FROM dbo.team
-             where modified_dttm >= CAST('{dateTime}' AS datetime)                                            
-            ORDER BY modified_dttm DESC
+            SELECT 
+              t.team_id, 
+              t.description, 
+              a.geocode_lat,
+              a.geocode_long,
+              t.modified_dttm,
+              MAX(t.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
+             FROM dbo.team t
+              join dbo.place p on p.place_id = t.place_id
+              left join dbo.place_address pa ON p.place_id = pa.place_id and pa.address_type = 'DEFAULT'
+              LEFT join dbo.address a on pa.address_id  = a.address_id
+             where t.modified_dttm >= CAST('{dateTime}' AS datetime)                                            
+            ORDER BY t.modified_dttm DESC
             """)
         await client.close()
 

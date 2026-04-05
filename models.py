@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import Column, Integer, String, DateTime, Index, Text, UniqueConstraint, CheckConstraint, text, ForeignKey, ForeignKeyConstraint,Time
+from sqlalchemy import Column, Date, Float, Integer, String, DateTime, Index, Text, UniqueConstraint, CheckConstraint, text, ForeignKey, ForeignKeyConstraint,Time
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from database import Base
 
@@ -79,6 +79,10 @@ class Teams(Base):
     uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
     client_team_id = Column(String(32), nullable=False)
     team_name = Column(String(128), nullable=False)
+    time_setup = Column(Integer, nullable=True)
+    time_service = Column(Integer, nullable=True)
+    geocode_lat = Column(String(32), nullable=True)
+    geocode_long = Column(String(32), nullable=True)    
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
     modified_by = Column(String(32), nullable=False)
@@ -144,12 +148,16 @@ class Resources(Base):
     uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
     client_resource_id = Column(String(32), nullable=False)
     description = Column(String(128), nullable=False)    
-    res_geocode_lat = Column(String(32), nullable=True)
-    res_geocode_long = Column(String(32), nullable=True)    
     actual_geocode_lat = Column(String(32), nullable=True)
     actual_geocode_long = Column(String(32), nullable=True)    
+    geocode_lat_from = Column(String(32), nullable=True)
+    geocode_long_from = Column(String(32), nullable=True)
+    geocode_lat_at = Column(String(32), nullable=True)
+    geocode_long_at = Column(String(32), nullable=True)
     logged_in = Column(DateTime, nullable=True)
     logged_out = Column(DateTime, nullable=True)
+    time_setup = Column(Integer, nullable=True)
+    time_service = Column(Integer, nullable=True)
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
     modified_by = Column(String(32), nullable=False)
@@ -317,12 +325,24 @@ class Jobs(Base):
     place_id  = Column(Integer, nullable=False)
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
+    actual_work_duration = Column(Integer, nullable=True)
+    simulated_work_duration = Column(Integer, nullable=True)
     plan_start_date = Column(DateTime, nullable=False)
     plan_end_date = Column(DateTime, nullable=False)
     actual_start_date = Column(DateTime, nullable=True)
     actual_end_date = Column(DateTime, nullable=True)
+    simulated_start_date = Column(DateTime, nullable=True)
+    simulated_end_date = Column(DateTime, nullable=True)
     time_limit_start = Column(DateTime, nullable=True)
     time_limit_end = Column(DateTime, nullable=True)
+    pp_resource_id = Column(String(32), nullable=True)
+    pp_start_date = Column(DateTime, nullable=True)
+    pp_end_date = Column(DateTime, nullable=True)
+    pt_job_id = Column(String(32), nullable=True)
+    pt_start_date = Column(DateTime, nullable=True)
+    pt_end_date = Column(DateTime, nullable=True)
+    pt_geocode_lat = Column(String(32), nullable=True)
+    pt_geocode_long = Column(String(32), nullable=True)    
     complements = Column(JSONB, nullable=True)
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
@@ -362,4 +382,82 @@ class Jobs(Base):
             UniqueConstraint('client_id','job_id','client_job_id', name='uk_jobs'),
             Index('idx_jobs_00', 'client_job_id','client_id'),
             Index('idx_jobs_01', 'modified_date','client_id')
+        )
+
+class Simulation(Base):
+    __tablename__ = "simulation"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, primary_key=True, nullable=False)
+    simulation_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    simulation_date = Column(Date, nullable=False)
+    sequence = Column(Integer, nullable=False)
+    fl_calc_board = Column(Integer, nullable=False, server_default=text("0"))
+    fl_calc_plan = Column(Integer, nullable=False, server_default=text("0"))
+    fl_calc_history = Column(Integer, nullable=False, server_default=text("0"))
+    fl_calc_arround = Column(Integer, nullable=False, server_default=text("0"))
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+    __table_args__ = (
+            ForeignKeyConstraint(
+                ['client_id', 'user_id'],
+                ['users.client_id', 'users.user_id'],
+                name='fk_simulation_users'
+            ),
+            UniqueConstraint('client_id','user_id', 'simulation_date', 'sequence', name='uk_simulation'),
+        )    
+
+class SimulationJobs(Base):
+    __tablename__ = "simulation_jobs"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, primary_key=True, nullable=False)
+    simulation_id = Column(Integer, primary_key=True, nullable=False)
+    job_id = Column(Integer, primary_key=True, nullable=False)
+    client_job_id = Column(String(128), nullable=False)
+    team_id  = Column(Integer, nullable=False)
+    resource_id  = Column(Integer, nullable=True)
+    job_status_id  = Column(Integer, nullable=False)
+    job_type_id  = Column(Integer, nullable=False)
+    address_id = Column(Integer, nullable=False)
+    place_id  = Column(Integer, nullable=False)
+    time_setup = Column(Integer, nullable=True)
+    default_time_service = Column(Integer, nullable=True)
+    actual_time_service = Column(Integer, nullable=True)
+    actual_work_duration = Column(Integer, nullable=True)
+    simulated_work_duration = Column(Integer, nullable=True)
+    actual_start_date = Column(DateTime, nullable=True)
+    actual_end_date = Column(DateTime, nullable=True)
+    simulated_start_date = Column(DateTime, nullable=True)
+    simulated_end_date = Column(DateTime, nullable=True)
+    simulated_window_start_date = Column(DateTime, nullable=True)
+    simulated_window_end_date = Column(DateTime, nullable=True)
+    time_limit_start = Column(DateTime, nullable=True)
+    time_limit_end = Column(DateTime, nullable=True)
+    complements = Column(JSONB, nullable=True)
+    order = Column(Integer, nullable=False, server_default=text("0"))
+    actual_distance = Column(Integer, nullable=True)
+    simulated_distance = Column(Integer, nullable=True)
+    actual_time_distance = Column(Integer, nullable=True)
+    simulated_time_distance = Column(Integer, nullable=True)
+    status_priority = Column(Integer, nullable=False, server_default=text("25"))
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+    __table_args__ = (
+            ForeignKeyConstraint(
+                ['client_id', 'simulation_id'],
+                ['simulation.client_id', 'simulation.simulation_id'],
+                name='fk_simulation_jobs_simulation'
+            ),
+            ForeignKeyConstraint(
+                ['client_id', 'job_id'],
+                ['jobs.client_id', 'jobs.job_id'],
+                name='fk_simulation_jobs_jobs'
+            ),
+            UniqueConstraint('client_id','simulation_id','client_job_id', name='uk_simulation_jobs'),
         )
