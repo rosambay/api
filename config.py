@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     senha: str 
     admin: str 
     passwd: str
-    client_uid: int 
+    client_uid: int
+    vroom_url: str = "https://routes.imagineit.com.br/routing"
 
     class Config:
         env_file = ".env"
