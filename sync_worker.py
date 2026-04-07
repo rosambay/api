@@ -116,6 +116,7 @@ async def getResources(r):
                               geocode_lat_from text,
                               geocode_long_from text,
                               geocode_lat_at text,
+                              work_status integer,
                               geocode_long_at text,
                               modified_dttm TIMESTAMP,
                               last_snap TIMESTAMP)) AS t
@@ -126,17 +127,19 @@ async def getResources(r):
                               OR u.geocode_lat_from IS DISTINCT FROM t.geocode_lat_from
                               OR u.geocode_long_from IS DISTINCT FROM t.geocode_long_from
                               OR u.geocode_lat_at IS DISTINCT FROM t.geocode_lat_at
+                              OR u.fl_off_shift IS DISTINCT FROM t.work_status
                               OR u.geocode_long_at IS DISTINCT FROM t.geocode_long_at
                               OR u.description IS DISTINCT FROM t.name
                               )  THEN
                       UPDATE SET actual_geocode_lat = t.geocode_lat
                           ,actual_geocode_long = t.geocode_long
                           ,description = t.name
+                          ,fl_off_shift = t.work_status
                           ,modified_by = 'INTEGRATION'
                           ,modified_date = t.modified_dttm
                   WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_resource_id, description, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.person_id, t.name, t.geocode_lat, t.geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                      INSERT (client_id,client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
+                      VALUES (:client_id, t.person_id, t.name, t.work_status, t.geocode_lat, t.geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
                   RETURNING
                        u.resource_id, merge_action(), to_jsonb(u) AS registro_json
               """)
@@ -898,7 +901,7 @@ async def getJobs(r):
                           OR u.job_type_id IS DISTINCT FROM t.job_type_id
                           OR u.job_status_id IS DISTINCT FROM t.job_status_id
                           OR u.created_date IS DISTINCT FROM t.created_dttm
-                          OR u.actual_work_duration IS DISTINCT FROM t.work_duration::INTEGER
+                          OR u.work_duration IS DISTINCT FROM t.work_duration::INTEGER
                           OR u.plan_start_date IS DISTINCT FROM t.plan_start_dttm
                           OR u.plan_end_date IS DISTINCT FROM t.plan_end_dttm
                           OR u.actual_start_date IS DISTINCT FROM t.actual_start_dttm
@@ -921,7 +924,7 @@ async def getJobs(r):
                       ,place_id = t.place_idd
                       ,job_type_id = t.job_type_id
                       ,job_status_id = t.job_status_id
-                      ,actual_work_duration = t.work_duration::INTEGER
+                      ,work_duration = t.work_duration::INTEGER
                       ,plan_start_date = t.plan_start_dttm
                       ,plan_end_date = t.plan_end_dttm
                       ,actual_start_date = t.actual_start_dttm
@@ -939,7 +942,7 @@ async def getJobs(r):
                       ,pt_geocode_long = t.pt_geocode_long
                       ,modified_date = t.modified_dttm
               WHEN NOT MATCHED THEN
-                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, actual_work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, created_by, created_date, modified_by, modified_date)
+                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, created_by, created_date, modified_by, modified_date)
                   VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, t.pp_person_id, t.pp_actual_start_dttm, t.pp_actual_end_dttm, t.pt_task_id, t.pt_actual_start_dttm, t.pt_actual_end_dttm, t.pt_geocode_lat, t.pt_geocode_long, 'INTEGRATION', t.created_dttm, 'INTEGRATION', t.modified_dttm)
               RETURNING
                   to_jsonb(u) AS registro_json, merge_action(), u.job_id
@@ -1015,10 +1018,12 @@ async def main():
     logger.info("Sync worker iniciado.")
 
     async with engine.begin() as conn:
+        
         # await conn.run_sync(Base.metadata.drop_all)
         # logger.info("Tabelas do banco dropadas com sucesso!")
         # await r.flushall()
         # logger.info("Cache Redis limpo com sucesso!")
+
         await conn.run_sync(Base.metadata.create_all)
         logger.info("Tabelas do banco verificadas/criadas com sucesso!")
 

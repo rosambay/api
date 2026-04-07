@@ -154,10 +154,12 @@ class Resources(Base):
     geocode_long_from = Column(String(32), nullable=True)
     geocode_lat_at = Column(String(32), nullable=True)
     geocode_long_at = Column(String(32), nullable=True)
+    fl_off_shift = Column(Integer, nullable=False, server_default=text("0"))
     logged_in = Column(DateTime, nullable=True)
     logged_out = Column(DateTime, nullable=True)
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
+    time_overlap = Column(Integer, nullable=True)
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
     modified_by = Column(String(32), nullable=False)
@@ -295,6 +297,7 @@ class JobType(Base):
     priority = Column(Integer, nullable=False, server_default=text("25"))
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
+    time_overlap = Column(Integer, nullable=True)
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
     modified_by = Column(String(32), nullable=False)
@@ -325,14 +328,12 @@ class Jobs(Base):
     place_id  = Column(Integer, nullable=False)
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
-    actual_work_duration = Column(Integer, nullable=True)
-    simulated_work_duration = Column(Integer, nullable=True)
+    time_overlap = Column(Integer, nullable=True)
+    work_duration = Column(Integer, nullable=True)
     plan_start_date = Column(DateTime, nullable=False)
     plan_end_date = Column(DateTime, nullable=False)
     actual_start_date = Column(DateTime, nullable=True)
     actual_end_date = Column(DateTime, nullable=True)
-    simulated_start_date = Column(DateTime, nullable=True)
-    simulated_end_date = Column(DateTime, nullable=True)
     time_limit_start = Column(DateTime, nullable=True)
     time_limit_end = Column(DateTime, nullable=True)
     pp_resource_id = Column(String(32), nullable=True)
@@ -425,7 +426,6 @@ class SimulationJobs(Base):
     address_id = Column(Integer, nullable=False)
     place_id  = Column(Integer, nullable=False)
     time_setup = Column(Integer, nullable=True)
-    default_time_service = Column(Integer, nullable=True)
     actual_time_service = Column(Integer, nullable=True)
     actual_work_duration = Column(Integer, nullable=True)
     simulated_work_duration = Column(Integer, nullable=True)
@@ -438,7 +438,9 @@ class SimulationJobs(Base):
     time_limit_start = Column(DateTime, nullable=True)
     time_limit_end = Column(DateTime, nullable=True)
     complements = Column(JSONB, nullable=True)
-    order = Column(Integer, nullable=False, server_default=text("0"))
+    actual_order = Column(Integer, nullable=False, server_default=text("0"))
+    simulated_order = Column(Integer, nullable=False, server_default=text("0"))
+    simulated_window_order = Column(Integer, nullable=False, server_default=text("0"))
     actual_distance = Column(Integer, nullable=True)
     simulated_distance = Column(Integer, nullable=True)
     simulated_window_distance = Column(Integer, nullable=True)
@@ -463,3 +465,36 @@ class SimulationJobs(Base):
             ),
             UniqueConstraint('client_id','simulation_id','client_job_id', name='uk_simulation_jobs'),
         )
+    
+class SimulationResources(Base):
+    __tablename__ = "simulation_resources"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, primary_key=True, nullable=False)
+    simulation_id = Column(Integer, primary_key=True, nullable=False)
+    resource_id  = Column(Integer, primary_key=True, nullable=False)
+    actual_distance_end = Column(Integer, nullable=True)
+    simulated_distance_end = Column(Integer, nullable=True)
+    simulated_window_distance_end = Column(Integer, nullable=True)
+    actual_time_distance_end = Column(Integer, nullable=True)
+    simulated_time_distance_end = Column(Integer, nullable=True)
+    simulated_window_time_distance_end = Column(Integer, nullable=True)
+    actual_end_date = Column(DateTime, nullable=True)
+    simulated_end_date = Column(DateTime, nullable=True)
+    simulated_window_end_date = Column(DateTime, nullable=True)
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+    __table_args__ = (
+            ForeignKeyConstraint(
+                ['client_id', 'simulation_id'],
+                ['simulation.client_id', 'simulation.simulation_id'],
+                name='fk_simulation_jobs_simulation'
+            ),
+            ForeignKeyConstraint(
+                ['client_id', 'resource_id'],
+                ['resources.client_id', 'resources.resource_id'],
+                name='fk_simulation_jobs_resources'
+            )
+        )    

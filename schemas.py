@@ -32,6 +32,16 @@ class ViewStylesResponse(BaseModel):
     background: str
     foreground: str
 
+class NewRoutesRequest(BaseModel):
+    p_date: str
+    resource_id: Optional[int] = None
+
+class ScheduleJobsRequest(BaseModel):
+    resource_id: int
+    simulation_id: int
+    p_date: str
+    jobs: List[int]
+
 class ViewResourceWindowsResponse(BaseModel):
     rw_id: int
     uid: UUID4

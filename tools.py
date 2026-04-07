@@ -749,10 +749,10 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     t.cnpj,
                     t.created_dttm, 
                     t.modified_dttm,
-                    t.work_duration,
+                    COALESCE(t.work_duration,0) * 60 AS work_duration, -- Converte para segundos
                     t.plan_start_dttm,
                     t.plan_end_dttm,
-                    t.plan_task_dur_min,
+                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_task_dur_min, -- Converte para segundos
                     t.actual_start_dttm,
                     t.actual_end_dttm,
                     t.sla,
@@ -844,6 +844,7 @@ async def getResourcesMatrix(dateTime: str = None, client_uid: str = None):
                 pg.geocode_long_from, 
                 pg.geocode_lat_at, 
                 pg.geocode_long_at,
+                CASE WHEN p.work_status = 'OFF SHIFT' THEN 1 ELSE 0 END as work_status,
                 p.modified_dttm, 
                 max(p.modified_dttm)  OVER (PARTITION BY 1)  last_snap
               from C_PERSON_VW p WITH (NOEXPAND)
