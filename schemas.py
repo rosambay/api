@@ -32,6 +32,23 @@ class ViewStylesResponse(BaseModel):
     background: str
     foreground: str
 
+class ResourceUpdateRequest(BaseModel):
+    fl_off_shift: Optional[int] = None
+    time_setup: Optional[int] = None
+    time_service: Optional[int] = None
+    time_overlap: Optional[int] = None
+
+class ResourceUpdateResponse(BaseModel):
+    resource_id: int
+    client_resource_id: str
+    fl_off_shift: int
+    time_setup: Optional[int]
+    time_service: Optional[int]
+    time_overlap: Optional[int]
+
+    class Config:
+        from_attributes = True
+
 class NewRoutesRequest(BaseModel):
     p_date: str
     resource_id: Optional[int] = None
@@ -39,6 +56,7 @@ class NewRoutesRequest(BaseModel):
 class ScheduleJobsRequest(BaseModel):
     resource_id: int
     simulation_id: int
+    action: str
     p_date: str
     jobs: List[int]
 

@@ -1,5 +1,4 @@
 import asyncio
-from turtle import distance
 import redis.asyncio as Redis
 import database
 import redis_client
@@ -9,30 +8,20 @@ import models, schemas
 from auth import verify_password, create_access_token
 from database import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, update
-from sqlalchemy.future import select
+from sqlalchemy import text, update, delete, exists
+from sqlalchemy.future import select 
 from fastapi import FastAPI, Depends, HTTPException, status,  Response, Request, Query, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import  List, Optional
 from jose import JWTError, jwt
 # from notification_service import criar_e_enviar_notificacao
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import settings
 from loguru import logger
 import httpx
 
 async def optimize_routes_vroom(payload: dict) -> dict:
-    """
-    Envia um payload no formato VROOM para o servidor configurado em VROOM_URL
-    e retorna a solução otimizada.
-
-    Estrutura esperada do payload:
-    {
-        "vehicles": [ { "id", "start", "end", "time_window" } ],
-        "jobs":     [ { "id", "location", "service", "time_windows" } ]
-    }
-    """
     logger.debug(
         "VROOM request | vehicles={} jobs={}",
         len(payload.get("vehicles", [])),
@@ -429,6 +418,10 @@ async def getResourcesTree(
             geocode_long_from,
             geocode_lat_at,
             geocode_long_at,
+            fl_off_shift,
+            time_setup,
+            time_service,
+            time_overlap,
             logged_in,
             logged_out,
             modified_date
@@ -540,20 +533,33 @@ async def getJobsResources(
 
 @app.get("/openjobs")
 async def getOpenJobs(
+    simulation_id: Optional[int] = None,
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    
+
     userId = current_user["userId"]
     userName = current_user["userName"]
     clientId = current_user["clientId"]
     try:
+      simulation_filter = ""
+      bind_params: dict = {"client_id": clientId, "user_id": userId}
+      if simulation_id is not None:
+          simulation_filter = """
+                and not exists (
+                    select 1 from simulation_jobs sj
+                    where sj.client_id = j.client_id
+                      and sj.job_id = j.job_id
+                      and sj.simulation_id = :simulation_id
+                )"""
+          bind_params["simulation_id"] = simulation_id
+
       smtp = text(f"""
-        select 
+        select
               j.client_id,
               j.job_id,
               j.client_job_id,
-              j.team_id, 
+              j.team_id,
               j.resource_id,
               r.client_resource_id,
               r.description AS resource_name,
@@ -580,7 +586,7 @@ async def getOpenJobs(
               j.actual_start_date,
               j.actual_end_date,
               j.plan_start_date,
-              j.plan_end_date, 
+              j.plan_end_date,
               j.pp_resource_id,
               j.time_limit_end
               from jobs j
@@ -593,8 +599,9 @@ async def getOpenJobs(
               where ut.client_id = :client_id
                 and ut.user_id = :user_id
                 and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') and  js.internal_code_status is not null)
+                {simulation_filter}
             order by j.team_id, j.resource_id nulls last, j.actual_start_date, j.plan_start_date,  a.geocode_lat, a.geocode_long
-        """).bindparams(client_id=clientId, user_id=userId)
+        """).bindparams(**bind_params)
       result = await db.execute(smtp)
       rows = result.mappings().all()
 
@@ -612,57 +619,161 @@ async def scheduleJobs(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(database.get_db),
 ):
-    """
-    Recebe um resource_id e a lista de jobs a serem agendados para aquele recurso.
-    """
     resourceId = body.resource_id
     simulationId = body.simulation_id
     p_date = body.p_date
     listJobs = body.jobs
+    action = body.action
     userId = current_user["userId"]
     userName = current_user["userName"]
     clientId = current_user["clientId"]
 
-    print("resource_id",body.resource_id, "simulation_id",body.simulation_id, "jobs_received", body.jobs, 'p_date', p_date)
+    logger.info(f"""Parâmetros: action - {action} resource_id - {resourceId}, simulation_id - {simulationId}, jobs - ({listJobs}),  p_date - {p_date}""")
+    jobExists = True
+    if action == 'I':
+      logger.info("Criando os jobs da simulação ...")
+      smtp = text(f"""
+        MERGE INTO simulation_jobs u
+            USING (SELECT client_id
+                          ,job_id
+                          ,client_job_id
+                          ,team_id
+                          ,job_status_id
+                          ,job_type_id
+                          ,address_id
+                          ,place_id
+                      FROM jobs
+                    WHERE client_id = :client_id
+                      AND job_id in ({','.join(str(j) for j in listJobs)})) t
+                ON (    u.client_id = t.client_id
+                    AND u.job_id = t.job_id
+                    AND u.simulation_id = :simulation_id)
+        WHEN NOT MATCHED
+        THEN
+          INSERT     (client_id
+                    ,simulation_id
+                    ,job_id
+                    ,client_job_id
+                    ,team_id
+                    ,resource_id
+                    ,job_status_id
+                    ,job_type_id
+                    ,address_id
+                    ,place_id
+                    ,created_by
+                    ,created_date
+                    ,modified_by
+                    ,modified_date)
+            VALUES (t.client_id
+                  , :simulation_id
+                  ,t.job_id
+                  ,t.client_job_id
+                  ,t.team_id
+                  , :resource_id
+                  ,t.job_status_id
+                  ,t.job_type_id
+                  ,t.address_id
+                  ,t.place_id
+                  , :user_name
+                  ,now ()
+                  , :user_name
+                  ,now ());
+      """).bindparams(client_id=clientId, user_name=userName, resource_id=resourceId, simulation_id = simulationId)
+      
+      result = await db.execute(smtp)
+    if action == 'D':
+       smtp = text(f"""
+        DELETE FROM simulation_jobs
+          WHERE client_id = :client_id
+            AND simulation_id = :simulation_id
+            AND job_id in ({','.join(str(j) for j in listJobs)})
+        """).bindparams(client_id=clientId, simulation_id = simulationId)
+       result = await db.execute(smtp)
+       await db.commit()
+       jobExists = await db.scalar(select(
+            exists().where(
+                models.SimulationJobs.client_id == clientId,
+                models.SimulationJobs.simulation_id  == simulationId,
+            )
+        ))
+       if not jobExists:
+          return []
+
+       
+    # await db.commit()
+    
+    
+    logger.info("Criando os resources da simulação ...")
+    smtp = text(f"""
+        MERGE INTO simulation_resources u
+            USING (SELECT client_id, resource_id
+                      FROM resources
+                    WHERE     client_id = :client_id
+                          AND resource_id = :resource_id) t
+                ON (    u.client_id = t.client_id
+                    AND u.resource_id = t.resource_id
+                    AND u.simulation_id = :simulation_id)
+        WHEN NOT MATCHED
+        THEN
+          INSERT     (client_id
+                    ,simulation_id
+                    ,resource_id
+                    ,created_by
+                    ,created_date
+                    ,modified_by
+                    ,modified_date)
+            VALUES (t.client_id
+                  , :simulation_id
+                  ,t.resource_id
+                  , :user_name
+                  ,now ()
+                  , :user_name
+                  ,now ());
+    """).bindparams(client_id=clientId, user_name=userName, resource_id=resourceId, simulation_id = simulationId)
+    result = await db.execute(smtp)
+    # await db.commit()
+    
+    logger.info("Iniciado Calculo das rotas ...")
     smtp = text(f"""
           WITH q1 AS (
-              SELECT   j.client_id,
-                      j.job_id,
-                      r.resource_id,
-                      r.time_overlap,
-                      j.address_id,
-                      a.geocode_lat::NUMERIC,
-                      a.geocode_long::NUMERIC,
-                      COALESCE(j.time_setup,jt.time_setup,t.time_setup) AS time_setup,
-                      r.time_setup AS time_setup_resource,
-                      COALESCE(j.time_service,jt.time_service,t.time_service) AS time_service,
-                      r.time_service AS time_service_resource,
-                      COALESCE(jt.priority,0) AS priority,
-                      EXTRACT(EPOCH FROM COALESCE(aw.start_time,rw.start_time)) ::INTEGER AS start_time,
-                      EXTRACT(EPOCH FROM COALESCE(aw.end_time,cast('23:59:59.9999' as time) )) ::INTEGER AS end_time
-                      
-              FROM jobs j
-                  JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                  JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
-                  JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-                  JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
-                  JOIN user_team ut ON ut.client_id = t.client_id AND ut.team_id = t.team_id
-                  JOIN resources r ON :client_id = r.client_id AND :resource_id = r.resource_id
-                  JOIN resource_windows rw ON rw.client_id = r.client_id AND rw.resource_id = r.resource_id AND rw.week_day = EXTRACT(DOW FROM COALESCE(j.actual_start_date, j.plan_start_date, NOW())) + 1
-                  LEFT JOIN address_windows aw ON aw.client_id = j.client_id AND aw.address_id = j.address_id AND aw.week_day = EXTRACT(DOW FROM COALESCE(j.actual_start_date, j.plan_start_date, NOW())) + 1
-              WHERE ut.client_id = :client_id
-                  AND ut.user_id = :user_id
-                  AND j.job_id in ({','.join(str(j) for j in listJobs)})
+              SELECT j.client_id
+                    ,j.job_id
+                    ,r.resource_id
+                    ,r.time_overlap
+                    ,j.address_id
+                    ,a.geocode_lat::NUMERIC geocode_lat
+                    ,a.geocode_long::NUMERIC geocode_long
+                    ,COALESCE (j.time_setup, jt.time_setup, r.time_setup, t.time_setup)                          AS time_setup
+                    ,COALESCE (j.time_service, jt.time_service, r.time_service, t.time_service)                    AS time_service
+                    ,COALESCE (jt.priority, 0)                                                     AS priority
+                    --,EXTRACT (epoch FROM COALESCE (aw.start_time, rw.start_time))::INTEGER AS start_time
+                    0 AS start_time,
+                    ,EXTRACT (epoch FROM COALESCE (aw.end_time, CAST ('23:59:59.9999' AS TIME)))::INTEGER AS end_time
+                FROM jobs  j
+                    JOIN simulation_jobs sj ON sj.client_id = j.client_id AND sj.job_id = j.job_id
+                    JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+                    JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
+                    JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+                    JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
+                    JOIN resources r ON r.client_id = j.client_id AND r.resource_id = j.resource_id
+                    JOIN resource_windows rw
+                      ON     rw.client_id = r.client_id
+                          AND rw.resource_id = r.resource_id
+                          AND rw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
+                    LEFT JOIN address_windows aw
+                      ON     aw.client_id = j.client_id
+                          AND aw.address_id = j.address_id
+                          AND aw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
+              WHERE     sj.client_id = :client_id
+                    AND sj.simulation_id = :simulation_id
+                    AND r.resource_id = :resource_id
           ),
           MapeamentoEnderecos AS (
               SELECT 
-                  *,
-                  -- 1. Conta o total de jobs para o mesmo address_id (e client_id, por segurança)
+                  q1.*,
                   COUNT(job_id) OVER (
                       PARTITION BY client_id, geocode_lat, geocode_long
                   ) AS quantidade_jobs_mesmo_endereco,
-                  
-                  -- 2. Cria um ranking ordenando pelo menor job_id
                   ROW_NUMBER() OVER (
                       PARTITION BY client_id, geocode_lat, geocode_long
                       ORDER BY job_id ASC
@@ -677,9 +788,7 @@ async def scheduleJobs(
                 geocode_lat,
                 geocode_long,
                 time_setup,
-                time_setup_resource,
                 time_service + (time_overlap * (quantidade_jobs_mesmo_endereco -1)) as time_service,
-                time_service_resource,
                 priority,
                 start_time,
                 end_time
@@ -693,13 +802,24 @@ async def scheduleJobs(
                   r.geocode_long_from::NUMERIC,
                   r.geocode_lat_at::NUMERIC,
                   r.geocode_long_at::NUMERIC, 
-                  EXTRACT(EPOCH FROM rw.start_time) ::INTEGER AS start_time,
+                  EXTRACT(EPOCH FROM
+                  CASE 
+                    WHEN CAST(:p_date as date) <= NOW() THEN
+                      CASE 
+                          WHEN COALESCE(rw.start_time, cast('00:00:00.9999' as time)) < NOW()::TIME 
+                          THEN 
+                              NOW()::TIME
+                          ELSE
+                          COALESCE(rw.start_time, cast('00:00:00' as time))
+                      END
+                    ELSE
+                      COALESCE(rw.start_time, cast('00:00:00' as time))
+                  END) ::INTEGER AS start_time,
                   EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end) ::INTEGER AS end_time
                 from resources r
                   join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM CAST('{p_date}' AS DATE)) + 1
-                  where exists (select 1 from jobs_data j
-                                where j.client_id = r.client_id
-                                  and j.resource_id = r.resource_id)
+                  where r.client_id = :client_id
+                    and r.resource_id = :resource_id
               ),
               vehicles_json AS (
                   SELECT json_agg(
@@ -722,34 +842,51 @@ async def scheduleJobs(
                           'id', job_id,
                           'location', json_build_array(geocode_long, geocode_lat),
                           'setup', time_setup,
-                          'setup_per_type', time_setup_resource,
                           'service', time_service,
-                          'service_per_type', time_service_resource,
                           'time_windows', json_build_array(json_build_array(start_time, end_time)) 
                       ))
                   ) AS array_jobs
                   FROM jobs_data
               )
-              -- Envelopa tudo no objeto raiz
               SELECT json_build_object(
                   'vehicles', (SELECT array_vehicles FROM vehicles_json),
                   'jobs', (SELECT array_jobs FROM jobs_json)
               ) AS vroom_payload;
-        """).bindparams(client_id=clientId, user_id=userId, resource_id=resourceId)
+    """).bindparams(client_id=clientId, simulation_id=simulationId, p_date = p_date, resource_id = resourceId)
 
     result = await db.execute(smtp)
     rows = result.mappings().all()
     if rows and len(rows) > 0:
       vroom_payload = rows[0]['vroom_payload']
       logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
+      print(vroom_payload)
       retorno = await optimize_routes_vroom(vroom_payload)
-      # print(retorno)
+      listIds = [item['id'] for item in retorno.get("unassigned", [])]
+      if listIds:
+        smtp = text(f"""
+          DELETE FROM simulation_jobs
+            WHERE client_id = :client_id
+              AND simulation_id = :simulation_id
+              AND job_id in ({','.join(str(j) for j in listIds)})
+          """).bindparams(client_id=clientId, simulation_id = simulationId)
+        result = await db.execute(smtp)
+        await db.commit()
+        jobExists = await db.scalar(select(
+              exists().where(
+                  models.SimulationJobs.client_id == clientId,
+                  models.SimulationJobs.simulation_id  == simulationId,
+              )
+          ))
+        if not jobExists:
+            return []
+
     steps = retorno['routes'][0]['steps']
-    somente_jobs = [step for step in steps if step.get('type') == 'job']
+    # somente_jobs = [step for step in steps if step.get('type') == 'job']
+    somente_jobs = [step for step in steps]
     jsonJobs = json.dumps(somente_jobs)
-    print(jsonJobs)
+    # print(jsonJobs)
     smtp = text(f""" 
-          with q1 as (
+          with qjson as (
           SELECT 
               id AS job_id,
               type,
@@ -770,7 +907,16 @@ async def scheduleJobs(
                   setup int,
                   service int,
                   waiting_time int
-              ))
+              )),
+          q1 AS (
+              SELECT * FROM qjson
+                WHERE type = 'job'),
+          q2 as (
+            select arrival from qjson
+              where type = 'start'),
+          q3 as (
+            select arrival from qjson
+              where type = 'end')
           SELECT   j.client_id,
                   j.job_id,
                   r.time_overlap,
@@ -782,34 +928,42 @@ async def scheduleJobs(
                   r.geocode_long_at,
                   COALESCE(j.time_service,jt.time_service,t.time_service) AS time_service,
                   q1.arrival,
+                  q2.arrival AS arrival_start,
+                  q3.arrival AS arrival_end,
                   q1.duration,
                   q1.setup,
                   q1.service,
                   q1.waiting_time
               FROM jobs j
+                  JOIN simulation_jobs sj ON sj.client_id = j.client_id AND sj.job_id = j.job_id
                   JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
                   JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                  JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
                   JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
-                  JOIN user_team ut ON ut.client_id = t.client_id AND ut.team_id = t.team_id
-                  JOIN resources r ON :client_id = r.client_id AND :resource_id = r.resource_id
+                  JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+                  JOIN resources r ON r.client_id = j.client_id AND r.resource_id = j.resource_id
                   JOIN q1 on q1.geocode_lat = a.geocode_lat::NUMERIC and q1.geocode_long = a.geocode_long::NUMERIC
-              WHERE ut.client_id = :client_id
-                  AND ut.user_id = :user_id
-                  AND j.job_id in ({','.join(str(j) for j in listJobs)})
+                  CROSS JOIN q2
+                  CROSS JOIN q3
+              WHERE sj.client_id = :client_id
+                  AND sj.simulation_id = :simulation_id
+                  and r.resource_id = :resource_id
                 order by q1.arrival, j.plan_start_date
-        """).bindparams(client_id=clientId, user_id=userId, resource_id = resourceId)
+        """).bindparams(client_id=clientId, simulation_id=simulationId, resource_id = resourceId)
     result = await db.execute(smtp)
     rows = result.mappings().all()
     rId = None
     geocode_long_at = None
     geocode_lat_at = None
     geo = []
+    arrivalStart = None
+    arrivalEnd = None
     for row in rows:
       if rId is None:
         geo.append([row.geocode_long_from,row.geocode_lat_from])
         geocode_long_at = row.geocode_long_at
         geocode_lat_at = row.geocode_lat_at
+        arrivalStart = row.arrival_start
+        arrivalEnd = row.arrival_end
         rId = 1
       geo.append([row.geocode_long,row.geocode_lat])
     geo.append([geocode_long_at,geocode_lat_at])
@@ -841,51 +995,137 @@ async def scheduleJobs(
       distance = round(geoResult[(rOrder - 1)]["distance"])
       timeDistance = round(geoResult[(rOrder - 1)]["duration"]) 
 
-      # await db.execute(
-      #     update(models.SimulationJobs)
-      #     .where(
-      #         models.SimulationJobs.client_id == clientId,
-      #         models.SimulationJobs.simulation_id == simulationId,
-      #         models.SimulationJobs.job_id == jobId,
-      #     )
-      #     .values(
-      #         simulated_window_start_date=vDtStart,
-      #         simulated_window_end_date=vDtEnd,
-      #         simulated_window_distance=distance,
-      #         simulated_window_time_distance=timeDistance,
-      #         simulated_window_order = rOrder,
-      #         modified_by=userName,
-      #         modified_date=datetime.now(),
-      #     )
-      # )
+      await db.execute(
+          update(models.SimulationJobs)
+          .where(
+              models.SimulationJobs.client_id == clientId,
+              models.SimulationJobs.simulation_id == simulationId,
+              models.SimulationJobs.job_id == jobId,
+          )
+          .values(
+              simulated_window_start_date=vDtStart,
+              simulated_window_end_date=vDtEnd,
+              simulated_window_distance=distance,
+              simulated_window_time_distance=timeDistance,
+              simulated_window_time_setup=vSetup,
+              simulated_window_order = rOrder,
+              modified_by=userName,
+              modified_date=datetime.now(),
+          )
+      )
       # await db.commit()
       rOrder += 1
       simulatedWindowEndDate = vDtEnd
-      
+        
 
-    logger.info(f'Calculando distância Simulada Window Final ...')
+      logger.info(f'Calculando distância Simulada Window Final ...')
 
-    simulatedWindowDistanceEnd = round(geoResult[(rOrder-1)]["distance"])
-    simulatedWindowTimeDistanceEnd = round(geoResult[(rOrder-1)]["duration"])
-    simulatedWindowEndDate = simulatedWindowEndDate + timedelta(seconds=simulatedWindowTimeDistanceEnd)
+      simulatedWindowDistanceEnd = round(geoResult[(rOrder-1)]["distance"])
+      simulatedWindowTimeDistanceEnd = round(geoResult[(rOrder-1)]["duration"])
+      simulatedWindowDistanceStart = round(geoResult[(0)]["distance"])
+      simulatedWindowTimeDistanceStart = round(geoResult[(0)]["duration"])
+     
+      todayZero = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+      simulatedWindowEndDate = todayZero + timedelta(seconds=arrivalEnd)
+      simulatedWindowStartDate = todayZero + timedelta(seconds=arrivalStart)
 
-    # await db.execute(
-    #     update(models.SimulationResources)
-    #     .where(
-    #         models.SimulationResources.client_id == clientId,
-    #         models.SimulationResources.simulation_id == simulationId,
-    #         models.SimulationResources.resource_id == resourceId
-    #     )
-    #     .values(
-    #         simulated_window_distance_end = simulatedWindowDistanceEnd,
-    #         simulated_window_end_date = simulatedWindowEndDate,
-    #         simulated_window_time_distance_end = simulatedWindowTimeDistanceEnd,
-    #         modified_by=userName,
-    #         modified_date=datetime.now(),
-    #     )
-    # )
-    # await db.commit()    
-    return {"status": "OK", "resource_id": body.resource_id, "simulation_id": body.simulation_id, "jobs_received": len(body.jobs)}
+      await db.execute(
+          update(models.SimulationResources)
+          .where(
+              models.SimulationResources.client_id == clientId,
+              models.SimulationResources.simulation_id == simulationId,
+              models.SimulationResources.resource_id == resourceId
+          )
+          .values(
+              simulated_window_distance_start = simulatedWindowDistanceStart,
+              simulated_window_start_date = simulatedWindowStartDate,
+              simulated_window_time_distance_start = simulatedWindowTimeDistanceStart,
+              simulated_window_distance_end = simulatedWindowDistanceEnd,
+              simulated_window_end_date = simulatedWindowEndDate,
+              simulated_window_time_distance_end = simulatedWindowTimeDistanceEnd,
+              modified_by=userName,
+              modified_date=datetime.now(),
+          )
+      )
+      await db.commit()   
+
+    smtp = text(f"""
+        with q1 as(
+            select 
+              'SIMULATED' as type,
+              j.job_id,
+              j.client_job_id,
+              j.team_id, 
+              j.resource_id, 
+              r.client_resource_id,
+              sr.simulated_window_distance_end as resource_simulated_window_distance_end,
+              sr.simulated_window_end_date as resource_simulated_window_end_date,
+              sr.simulated_window_time_distance_end as resource_simulated_window_time_distance_end,
+              sr.simulated_window_distance_start as resource_simulated_window_distance_start,
+              sr.simulated_window_start_date as resource_simulated_window_start_date,
+              sr.simulated_window_time_distance_start as resource_simulated_window_time_distance_start,
+              j.simulated_window_order,
+              j.job_status_id, 
+              js.description AS status_description,
+              js.internal_code_status,
+              js.style_id,
+              j.job_type_id, 
+              jt.description as type_description,
+              j.address_id, 
+              a.client_address_id, 
+              a.geocode_lat, 
+              a.geocode_long, 
+              a.address, 
+              a.city, 
+              a.state_prov, 
+              a.zippost, 
+              p.trade_name, 
+              p.cnpj,
+              j.simulated_window_time_setup,
+              j.simulated_window_start_date,
+              j.simulated_window_end_date,
+              j.simulated_window_distance,
+              j.simulated_window_time_distance
+              from simulation_jobs j
+              JOIN simulation_resources sr on sr.client_id = j.client_id and sr.simulation_id = j.simulation_id and sr.resource_id = j.resource_id
+              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
+              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
+              join address a on a.client_id = j.client_id and a.address_id = j.address_id
+              join places p on p.client_id = j.client_id and p.place_id = j.place_id
+              join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
+              where j.client_id = :client_id
+                and j.simulation_id = :simulation_id
+                and j.resource_id = :resource_id )
+        select
+            q1.team_id,
+            q1.resource_id,
+            q1.resource_simulated_window_distance_end,
+            q1.resource_simulated_window_end_date,
+            q1.resource_simulated_window_time_distance_end,
+            q1.resource_simulated_window_distance_start,
+            q1.resource_simulated_window_start_date,
+            q1.resource_simulated_window_time_distance_start,
+            jsonb_agg(to_jsonb(q1) ORDER BY q1.simulated_window_order) AS resources
+          from q1
+          group by q1.team_id,
+            q1.resource_id,
+            q1.resource_simulated_window_distance_end,
+            q1.resource_simulated_window_end_date,
+            q1.resource_simulated_window_time_distance_end,
+            q1.resource_simulated_window_distance_start,
+            q1.resource_simulated_window_start_date,
+            q1.resource_simulated_window_time_distance_start
+            
+      """).bindparams(client_id=clientId, simulation_id = simulationId, resource_id = resourceId)
+    logger.info('Iniciou terceira consulta...')             
+    result = await db.execute(smtp)
+    rows = result.mappings().all()
+
+    res = [dict(row) for row in rows]
+    logger.info('Finalizou terceira consulta...')             
+    return res       
+    # return {"status": "OK", "resource_id": body.resource_id, "simulation_id": body.simulation_id, "jobs_received": len(body.jobs)}
 
 
 @app.post("/newroutes")
@@ -1587,168 +1827,6 @@ async def getSimulationJobs(
         await db.commit()    
         
         logger.info('Finalizado Otimização das rotas Simulação Janela Default ...')
-        # Aqui você pode chamar a função de otimização passando o payload
-        # optimized_solution = await optimize_routes_vroom(vroom_payload)
-        # print("Solução otimizada do VROOM: ", optimized_solution)
-      # ## Fazemos o for para criar as tarefas simuladas
-      # smtp = text(f"""
-      #   select a.*,
-      #     EXTRACT(EPOCH FROM 
-      #       case 
-      #           when a.pt_end_date is null 
-      #             then 
-      #               a.actual_start_date - a.start_day
-      #           else 
-      #             a.actual_start_date - a.pt_end_date
-      #         end )::INTEGER AS actual_time_arrived
-      #   from (
-        # select 
-        #       js.description AS status_description,
-        #       j.team_id, 
-        #       j.job_id,
-        #       j.client_job_id,
-        #       t.client_team_id,
-        #       j.resource_id,
-        #       j.job_status_id,
-        #       j.job_type_id,
-        #       j.address_id,
-        #       j.place_id,
-        #       r.client_resource_id,
-        #       j.actual_start_date,
-        #       j.actual_end_date,
-        #       a.geocode_lat,
-        #       a.geocode_long,
-        #       j.time_setup,
-        #       j.time_service,
-        #       J.time_limit_start,
-        #       J.time_limit_end,
-        #       j.actual_work_duration * 60 as actual_work_duration,
-        #       EXTRACT(ISODOW FROM j.actual_start_date) week_day,
-        #       CASE 
-        #         WHEN j.pt_geocode_lat is null
-        #           THEN r.geocode_lat_from
-        #         ELSE
-        #           j.pt_geocode_lat
-        #       END AS geocode_lat_before,
-        #       CASE 
-        #         WHEN j.pt_geocode_long is null
-        #           THEN r.geocode_long_from
-        #         ELSE
-        #           j.pt_geocode_long
-        #       END AS geocode_long_before,
-        #       EXTRACT(EPOCH FROM (j.actual_end_date - j.actual_start_date) )::INTEGER AS actual_time_service,
-        #       j.time_service * 60 AS time_service,
-        #       j.pt_job_id,
-        #       cast(j.actual_start_date as date) + rw.start_time AS start_day,
-        #       cast(j.actual_start_date as date) + rw.end_time AS end_day,
-        #       j.pt_end_date
-        #       from jobs j
-        #       join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-        #       join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-        #       join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-        #       join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-        #       join address a on a.client_id = j.client_id and a.address_id = j.address_id
-        #       join places p on p.client_id = j.client_id and p.place_id = j.place_id
-        #       join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-        #       join resource_windows rw on rw.client_id = j.client_id and rw.resource_id = j.resource_id and rw.week_day = EXTRACT(ISODOW FROM j.actual_start_date)
-        #       where ut.client_id = :client_id
-        #         and ut.user_id = :user_id
-        #         and j.actual_start_date >= cast(:date as date) and j.actual_start_date < cast(:date as date) + interval '1 day'
-        #        and j.resource_id in ({resources})
-        #        and js.internal_code_status = 'CONCLU'
-      #         order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
-      #   ) as a
-      # """).bindparams(client_id=clientId, user_id=userId, date=p_date)
-      # result = await db.execute(smtp)
-      # rows = result.mappings().all()
-      # rId = None
-      # rDtStartReal = None
-      # rDtEndReal = None
-      # rDtStartWindow = None
-      # rDtEndWindow = None
-      # rWorkDurationTotal = 0
-      # rWorkDurationSimulado = 0
-      # rOrder = 1
-      # for row in rows:
-      #     if rId != row.resource_id:
-      #       print('-----------------------------')
-      #       print('Recurso: ', row.client_resource_id)
-      #       rId = row.resource_id
-      #       rDtStartReal = row.start_day
-      #       rDtStartWindow = row.start_day
-
-      #     minhas_coordenadas = [
-      #         [row.geocode_long_before, row.geocode_lat_before],
-      #         [row.geocode_long, row.geocode_lat]
-      #     ]
-      #     retorno = await get_route_distance(minhas_coordenadas)
-      #     distance = round(retorno['distance_meters'])
-      #     timeDistance = round(retorno['distance_time'])      
-      #     # print('Distance: ', distance)
-      #     # print('Tempo  : ', timeDistance)
-      #     # print('Tempo Atual  : ', row.actual_time_arrived)
-      #     # print('Tempo de Serviço Atual : ', row.actual_time_service)
-      #     # print('Tempo Janela de Serviço  : ', row.time_service)
-      #     # print('Data e hora Iniciou  : ', row.actual_start_date)
-      #     rDtStartReal = rDtStartReal + timedelta(seconds=timeDistance)
-      #     rDtEndReal = rDtStartReal + timedelta(seconds=row.actual_time_service)
-      #     rDtStartWindow = rDtStartWindow + timedelta(seconds=timeDistance)
-      #     rDtEndWindow = rDtStartWindow + timedelta(seconds=row.time_service)
-      #     rSimulatedWorkDuration = (row.actual_time_service or 0) + (timeDistance or 0)
-      #     print('Data e hora Simulada Inicio  : ', rDtStartReal)
-      #     print('Data e hora Simulada Janela Inicio  : ', rDtStartWindow)
-      #     print('Data e hora Iniciou  : ', row.actual_start_date)
-      #     print('Data e hora Simulada Fim  : ', rDtEndReal)
-      #     print('Data e hora Simulada Janela Fim  : ', rDtEndWindow)
-      #     print('Data e hora Fim  : ', row.actual_end_date)
-      #     print('Work Duration  : ', row.actual_work_duration)
-      #     print('Work Duration Simulado  : ', rSimulatedWorkDuration)
-      #     rWorkDurationTotal = rWorkDurationTotal + (row.actual_work_duration or 0)
-      #     rWorkDurationSimulado = rWorkDurationSimulado + (row.actual_time_service or 0) + (timeDistance or 0)
-      #     # insere on banco e muda a data Start
-      #     newSimulationJobs = models.SimulationJobs(
-      #           client_id = clientId,
-      #           simulation_id = simulationId,
-      #           job_id = row.job_id,
-      #           client_job_id = row.client_job_id,
-      #           team_id  = row.team_id,
-      #           resource_id  = row.resource_id,
-      #           job_status_id  = row.job_status_id,
-      #           job_type_id  = row.job_type_id,
-      #           address_id = row.address_id,
-      #           place_id  = row.place_id,
-      #           time_setup = row.time_setup,
-      #           default_time_service = row.time_service,
-      #           actual_time_service = row.actual_time_service,
-      #           actual_work_duration = row.actual_work_duration,
-      #           simulated_work_duration = rSimulatedWorkDuration,
-      #           actual_start_date = row.actual_start_date,
-      #           actual_end_date = row.actual_end_date,
-      #           simulated_start_date = rDtStartReal,
-      #           simulated_end_date = rDtEndReal,
-      #           simulated_window_start_date = rDtStartWindow,
-      #           simulated_window_end_date = rDtEndWindow,
-      #           time_limit_start = row.time_limit_start,
-      #           time_limit_end = row.time_limit_end,
-      #           order = rOrder,
-      #           actual_distance = distance,
-      #           simulated_distance = distance,
-      #           actual_time_distance = row.actual_time_arrived,
-      #           simulated_time_distance = timeDistance,
-      #           created_by = userName,
-      #           created_date = datetime.now(),
-      #           modified_by = userName,
-      #           modified_date = datetime.now()
-      #     )
-      #     db.add(newSimulationJobs)
-      #     await db.commit()
-      #     rDtStartReal = rDtEndReal
-      #     rDtStartWindow = rDtEndWindow
-      #     rOrder = rOrder + 1
-      #     #           # print("Tempo de deslocamento estimado (em minutos): ", retorno, ' - ', row.actual_time_arrived)
-      # print('Work Duration Total  : ', rWorkDurationTotal)
-      # print('Work Duration Simulado  : ', rWorkDurationSimulado)    
-
       
       smtp = text(f"""
         with q1 as(
@@ -1853,8 +1931,47 @@ async def getSimulationJobs(
       rows = result.mappings().all()
 
       res = [dict(row) for row in rows]
-      logger.info('Finalizou terceira consulta...')             
-      return res      
+      logger.info('Finalizou terceira consulta...')
+      return res
       # return vroom_payload
 
-   
+
+
+# ROTAS DE RESOURCES
+
+@app.patch("/resources/{resource_id}", response_model=schemas.ResourceUpdateResponse)
+async def updateResource(
+    resource_id: int,
+    body: schemas.ResourceUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    client_id = current_user["clientId"]
+    user_name = current_user["userName"]
+
+    result = await db.execute(
+        select(models.Resources).where(
+            models.Resources.client_id == client_id,
+            models.Resources.resource_id == resource_id
+        )
+    )
+    resource = result.scalar_one_or_none()
+
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource não encontrado")
+
+    update_data = body.model_dump(exclude_none=True)
+    if not update_data:
+        raise HTTPException(status_code=422, detail="Nenhum campo para atualizar")
+
+    for field, value in update_data.items():
+        setattr(resource, field, value)
+
+    resource.modified_by = user_name
+    resource.modified_date = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    await db.commit()
+    await db.refresh(resource)
+
+    return resource
+
