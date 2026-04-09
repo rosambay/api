@@ -10,7 +10,7 @@ from config import settings
 import models
 from auth import get_password_hash
 from tools import (
-    getJobStatusMatrix, getJobTypeMatrix, getPlaceMatrix, getResourceWindowMatrix,
+    getJobStatusMatrix, getJobTypeMatrix, getPlaceMatrix, getPriorityMatrix, getResourceWindowMatrix,
     getStyleMetrix, getResourcesMatrix, getTeamMatrix, getJobsMatrix, getGeoPosMatrix,
     getTeamMemberMatrix, getLogInOutMatrix, getAdressMatrix
 )
@@ -857,9 +857,12 @@ async def getJobs(r):
                       a.address_id AS address_idd,
                       p.place_id AS place_idd,
                       jt.job_type_id,
-                      js.job_status_id
+                      js.job_status_id,
+                      COALESCE(py.priority,0) AS priority
+
                       FROM jsonb_to_recordset(:dados_json)
                         AS x( request_id text,
+                              contr_type text,
                               task_id text,
                               team_id text,
                               person_id text,
@@ -891,6 +894,7 @@ async def getJobs(r):
                       JOIN job_types jt ON jt.client_job_type_id = x.task_type AND jt.client_id = :client_id
                       JOIN job_status js ON js.client_job_status_id = x.task_status AND js.client_id = :client_id
                       JOIN places p ON p.client_place_id = x.place_id AND p.client_id = :client_id
+                      LEFT JOIN priority py ON x.contr_type = py.client_priority_id AND :client_id = py.client_id
                       ) AS t
               ON u.client_id = :client_id AND u.client_job_id = t.client_job_id
               WHEN MATCHED AND (
@@ -917,6 +921,7 @@ async def getJobs(r):
                           OR u.pt_end_date IS DISTINCT FROM t.pt_actual_end_dttm
                           OR u.pt_geocode_lat IS DISTINCT FROM t.pt_geocode_lat
                           OR u.pt_geocode_long IS DISTINCT FROM t.pt_geocode_long
+                          OR u.priority IS DISTINCT FROM t.priority
                           ) THEN
                   UPDATE SET team_id = t.team_idd
                       ,resource_id = t.resource_id
@@ -940,10 +945,11 @@ async def getJobs(r):
                       ,pt_end_date = t.pt_actual_end_dttm
                       ,pt_geocode_lat = t.pt_geocode_lat
                       ,pt_geocode_long = t.pt_geocode_long
+                      ,priority = t.priority
                       ,modified_date = t.modified_dttm
               WHEN NOT MATCHED THEN
-                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, created_by, created_date, modified_by, modified_date)
-                  VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, t.pp_person_id, t.pp_actual_start_dttm, t.pp_actual_end_dttm, t.pt_task_id, t.pt_actual_start_dttm, t.pt_actual_end_dttm, t.pt_geocode_lat, t.pt_geocode_long, 'INTEGRATION', t.created_dttm, 'INTEGRATION', t.modified_dttm)
+                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, priority, created_by, created_date, modified_by, modified_date)
+                  VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, t.pp_person_id, t.pp_actual_start_dttm, t.pp_actual_end_dttm, t.pt_task_id, t.pt_actual_start_dttm, t.pt_actual_end_dttm, t.pt_geocode_lat, t.pt_geocode_long, t.priority, 'INTEGRATION', t.created_dttm, 'INTEGRATION', t.modified_dttm)
               RETURNING
                   to_jsonb(u) AS registro_json, merge_action(), u.job_id
           """)
@@ -958,6 +964,50 @@ async def getJobs(r):
           await r.set(snapKey, last_snap)
       except Exception as e:
                 logger.error(f"[getJobs] Erro ao processar postgres: {e}")
+    return
+
+async def getPriority(r):
+    logger.warning("[getPriority] Entrou atualização das Janelas de Recursos ...")
+
+
+    result_rows = await getPriorityMatrix()
+    if result_rows:
+          try:
+              jsonResults = json.dumps(result_rows)
+
+              stmt = text(f"""
+                  MERGE INTO priority AS u
+                  USING (SELECT
+                            x.*
+                          FROM jsonb_to_recordset(:dados_json)
+                            AS x(
+                              contr_type text,
+                              ranking integer) ) AS t
+                  ON u.client_id = :client_id AND u.client_priority_id = t.contr_type
+                  WHEN MATCHED AND (
+                              u.priority IS DISTINCT FROM t.ranking
+                              )  THEN
+                      UPDATE SET 
+                          priority = t.ranking
+                          ,modified_by = 'INTEGRATION'
+                          ,modified_date = NOW()
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, client_priority_id, priority, created_by, created_date, modified_by, modified_date)
+                      VALUES (:client_id, t.contr_type, t.ranking, 'INTEGRATION', NOW(), 'INTEGRATION', NOW())
+                  RETURNING
+                       u.priority_id, merge_action(), to_jsonb(u) AS registro_json
+              """)
+
+              async with SessionLocal() as db:
+                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
+                await db.commit()
+                for row in result:
+                  logger.info(f"ID: {row.priority_id} | Ação PRIORITY realizada: {row.merge_action}")
+
+
+          except Exception as e:
+                    logger.error(f"[getResourceWindow] Erro ao processar postgres: {e}")
+
     return
 
 
@@ -992,6 +1042,35 @@ async def processo_em_background(r):
                 await getJobType(r)
                 await asyncio.sleep(0.2)
                 await getJobStatus(r)
+
+                if consecutive_failures > 0:
+                    logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
+                consecutive_failures = 0
+                sleep_time = SLEEP_NORMAL
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_failures += 1
+                sleep_time = min(SLEEP_NORMAL * (2 ** consecutive_failures), SLEEP_MAX)
+                logger.error(f"Erro na iteração do background job (falha #{consecutive_failures}): {e}. Próxima tentativa em {sleep_time}s.")
+
+            logger.warning(f'Aguardando {sleep_time}s para próximo refresh ...')
+            await asyncio.sleep(sleep_time)
+
+    except asyncio.CancelledError:
+        logger.info("Processo contínuo foi encerrado.")
+
+
+async def processo_em_background_longo(r):
+    SLEEP_NORMAL = 21600
+    SLEEP_MAX = 300
+    consecutive_failures = 0
+
+    try:
+        while True:
+            try:
+                await getPriority(r)
 
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
@@ -1060,7 +1139,11 @@ async def main():
             await db.commit()
 
     try:
-        await processo_em_background(r)
+        await asyncio.gather(
+            processo_em_background(r),
+            processo_em_background_longo(r)
+            # adicione outros workers aqui, ex: outro_processo(r),
+        )
     finally:
         await r.aclose()
         logger.info("Sync worker encerrado.")

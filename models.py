@@ -33,6 +33,18 @@ class Users(Base):
     modified_by = Column(String(32), nullable=False)
     modified_date = Column(DateTime, nullable=False)
 
+class Priority(Base):
+    __tablename__ = "priority"
+    client_id = Column(Integer, ForeignKey("clients.client_id"), primary_key=True, nullable=False)
+    priority_id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_priority_id = Column(String(32), nullable=False)    
+    priority = Column(Integer, nullable=False, server_default=text("0"))
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+
 class UserTeam(Base):
     __tablename__ = "user_team"
     client_id = Column(Integer, ForeignKey("clients.client_id"), nullable=False)
@@ -326,6 +338,7 @@ class Jobs(Base):
     job_type_id  = Column(Integer, nullable=False)
     address_id = Column(Integer, nullable=False)
     place_id  = Column(Integer, nullable=False)
+    priority = Column(Integer, nullable=False, server_default=text("0"))
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
     time_overlap = Column(Integer, nullable=True)
@@ -425,22 +438,28 @@ class SimulationJobs(Base):
     job_type_id  = Column(Integer, nullable=False)
     address_id = Column(Integer, nullable=False)
     place_id  = Column(Integer, nullable=False)
+    time_setup = Column(Integer, nullable=True)
+    time_service = Column(Integer, nullable=True)
+    start_date = Column(DateTime, nullable=True)
+    end_date = Column(DateTime, nullable=True)
+    time_limit_start = Column(DateTime, nullable=True)
+    time_limit_end = Column(DateTime, nullable=True)
     actual_time_setup = Column(Integer, nullable=True)
+    order = Column(Integer, nullable=False, server_default=text("0"))
+    distance = Column(Integer, nullable=True)
+    time_distance = Column(Integer, nullable=True)
+    priority = Column(Integer, nullable=False, server_default=text("0"))
+
     simulated_time_setup = Column(Integer, nullable=True)
     simulated_window_time_setup = Column(Integer, nullable=True)
     actual_time_service = Column(Integer, nullable=True)
     actual_work_duration = Column(Integer, nullable=True)
     simulated_work_duration = Column(Integer, nullable=True)
-    actual_start_date = Column(DateTime, nullable=True)
-    actual_end_date = Column(DateTime, nullable=True)
     simulated_start_date = Column(DateTime, nullable=True)
     simulated_end_date = Column(DateTime, nullable=True)
     simulated_window_start_date = Column(DateTime, nullable=True)
     simulated_window_end_date = Column(DateTime, nullable=True)
-    time_limit_start = Column(DateTime, nullable=True)
-    time_limit_end = Column(DateTime, nullable=True)
     complements = Column(JSONB, nullable=True)
-    actual_order = Column(Integer, nullable=False, server_default=text("0"))
     simulated_order = Column(Integer, nullable=False, server_default=text("0"))
     simulated_window_order = Column(Integer, nullable=False, server_default=text("0"))
     actual_distance = Column(Integer, nullable=True)
@@ -475,6 +494,16 @@ class SimulationResources(Base):
     client_id = Column(Integer, primary_key=True, nullable=False)
     simulation_id = Column(Integer, primary_key=True, nullable=False)
     resource_id  = Column(Integer, primary_key=True, nullable=False)
+    
+    distance_end = Column(Integer, nullable=True)
+    distance_start = Column(Integer, nullable=True)
+    time_distance_start = Column(Integer, nullable=True)
+    time_distance_end = Column(Integer, nullable=True)
+    start_date = Column(DateTime, nullable=True)
+    end_date = Column(DateTime, nullable=True)
+
+
+
     actual_distance_end = Column(Integer, nullable=True)
     simulated_distance_end = Column(Integer, nullable=True)
     simulated_window_distance_start = Column(Integer, nullable=True)

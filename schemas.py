@@ -60,6 +60,27 @@ class ScheduleJobsRequest(BaseModel):
     p_date: str
     jobs: List[int]
 
+class AllScheduleJobsRequest(BaseModel):
+    team_id: int
+    simulation_id: int
+    action: str
+    p_date: str
+    jobs: List[int]
+
+class SimulationRealTimeJobsRequest(BaseModel):
+    team_id: int
+    p_date: str
+    type: str # pode ser JED - Jobs estimated Done,  JRD-Jobs Real Done
+    resources: List[int]
+
+class SimulationBestRouteJobsRequest(BaseModel):
+    team_id: int
+    p_date: str
+    type: str # pode ser BRAC - Best Resources Actual,  BRAA Best Resrouces All Actual
+
+class ClearScheduleJobsRequest(BaseModel):
+    resource_id: int
+    simulation_id: int
 class ViewResourceWindowsResponse(BaseModel):
     rw_id: int
     uid: UUID4

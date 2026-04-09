@@ -735,6 +735,7 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
             FROM ( 
                 SELECT TOP 5000
                     t.request_id,
+                    t.contr_type,
                     t.task_id, 
                     t.team_id,
                     t.desc_team,
@@ -1184,3 +1185,32 @@ async def getResourceWindowMatrix(dateTime: str = None, client_uid: str = None):
         
     except Exception as e:
         logger.error(f"[getResourceWindowMatrix] Erro ao testar conexão: {e}")
+
+async def getPriorityMatrix(client_uid: str = None):
+    try:
+        # Cria cliente FSM
+        config = FSMConnectionConfig(
+            host=settings.url_fsm,
+            username=settings.usuario,
+            password=settings.senha,
+            target=FSMTarget.WCF
+        )
+        
+        client = FSMClient(config)
+
+        app_params_response = await client.execute_query(f"""
+            SELECT 
+              contr_type, 
+              ranking 
+             FROM dbo.C_PRIORITY_VW
+            """)
+        await client.close()
+
+        if app_params_response.success:
+                logger.info(f"[getPriorityMatrix] Template executado com sucesso")
+                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
+        
+        return (result_rows)
+        
+    except Exception as e:
+        logger.error(f"[getPriorityMatrix] Erro ao testar conexão: {e}")
