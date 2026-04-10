@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.future import select
 from database import engine, Base, SessionLocal
 from config import settings
+from services import optimize_routes_vroom, get_route_distance_block
 import models
 from auth import get_password_hash
 from tools import (
@@ -22,6 +23,174 @@ def oneHour(dateTime: str):
     nova_data_obj = data_obj - timedelta(hours=1)
     return nova_data_obj.strftime('%Y-%m-%d %H:%M:%S')
 
+
+async def deleteJobs():
+    
+    tempDateTime = (datetime.now() - timedelta(days=7))
+    pDate = tempDateTime.strftime('%Y-%m-%d')
+    #vamos verificar se existe alguma tarefa concluida sem distância calculada
+    async with SessionLocal() as db:
+      smtp = text("DELETE FROM jobs WHERE created_date < CAST(:p_date AS DATE);").bindparams(p_date=pDate)
+      await db.execute(smtp)
+      # smtp = text("""DELETE FROM address a
+      #                 WHERE NOT EXISTS (SELECT 1 
+      #                                     FROM jobs j 
+      #                                     WHERE j.client_id = a.client_id
+      #                                       AND j.address_id = a.address_id);
+      #             """)
+      # await db.execute(smtp)
+      await db.commit()
+
+async def calDistance():
+    #vamos verificar se existe alguma tarefa concluida sem distância calculada
+    smtp = text("""
+      WITH q1 AS (
+        SELECT 
+          j.client_id,
+          j.team_id,
+          j.resource_id,
+          DATE_TRUNC('day',j.actual_start_date) AS fix_start_date,
+          j.actual_start_date,
+          EXTRACT(EPOCH FROM (j.actual_end_date - j.actual_start_date))::INTEGER AS duration,
+          a.geocode_long,
+          a.geocode_lat,
+          CASE 
+            WHEN r.geocode_lat_at IS NULL 
+              THEN 
+                FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
+            ELSE 
+              r.geocode_lat_at 
+          END AS geocode_lat_at,
+          CASE 
+            WHEN r.geocode_long_at IS NULL 
+              THEN 
+                FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
+            ELSE 
+              r.geocode_long_at 
+          END AS geocode_long_at,
+          CASE 
+            WHEN r.geocode_lat_from IS NULL 
+              THEN 
+                FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
+            ELSE 
+              r.geocode_lat_from 
+          END AS geocode_lat_from,
+          CASE 
+            WHEN r.geocode_long_from IS NULL 
+              THEN 
+                FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
+            ELSE 
+              r.geocode_long_from 
+          END AS geocode_long_from,
+          bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date)) AS null_distance,
+          bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date)) AS null_geo,
+          CASE 
+              WHEN ROW_NUMBER() OVER (
+                  PARTITION BY  j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) 
+                  ORDER BY j.actual_start_date ASC
+              ) = 1 THEN true 
+              ELSE false 
+          END AS is_primeiro_do_dia
+        FROM jobs j
+          JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+          JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+          JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
+          JOIN resources r on r.client_id = j.client_id AND r.resource_id = j.resource_id
+          /*LEFT JOIN LATERAL (
+                  SELECT a2.geocode_lat, a2.geocode_long
+                    FROM jobs j2
+                    JOIN address a2 ON a2.client_id = j2.client_id AND a2.address_id = j2.address_id
+                    WHERE j2.actual_start_date < j.actual_start_date
+                      AND j2.actual_start_date >= DATE_TRUNC('day', j.actual_start_date)
+                      AND j2.job_status_id = j.job_status_id
+                      AND j2.team_id = j.team_id
+                      AND j2.client_id = j.client_id
+                      AND j2.resource_id = j.resource_id
+                    ORDER BY j2.actual_start_date DESC
+                    LIMIT 1
+                ) jl ON true*/
+        WHERE js.internal_code_status = 'CONCLU'
+          and j.actual_start_date is not null
+          order by j.client_id, j.team_id, j.resource_id, j.actual_start_date
+      )
+      SELECT
+        q1.client_id,
+        q1.team_id,
+        q1.resource_id, 
+        q1.fix_start_date,
+        (
+          jsonb_build_array(jsonb_build_array(MAX(q1.geocode_long_from)::NUMERIC, MAX(q1.geocode_lat_from)::NUMERIC))
+          ||
+          jsonb_agg(jsonb_build_array(q1.geocode_long::NUMERIC, q1.geocode_lat::NUMERIC) ORDER BY q1.actual_start_date) 
+          || 
+          jsonb_build_array(jsonb_build_array(MAX(q1.geocode_long_at)::NUMERIC, MAX(q1.geocode_lat_at)::NUMERIC))
+        ) AS rota_completa
+      FROM q1
+      WHERE null_distance = true
+      AND null_geo = false
+      GROUP BY q1.client_id,
+        q1.team_id, q1.resource_id,q1.fix_start_date
+      ORDER BY q1.client_id,
+        q1.team_id,q1.resource_id,q1.fix_start_date;
+    """)
+    async with SessionLocal() as db:
+      result = await db.execute(smtp)
+      rows = result.mappings().all()
+      for row in rows:
+        resourceId = row.resource_id
+        pDate = row.fix_start_date
+        clientId = row.client_id
+        print("Resource ...", resourceId)
+        geo = row.rota_completa
+        geoResult = await get_route_distance_block(geo)
+        geoJson = json.dumps(geoResult)
+        print(geoJson)
+        smtp = text(f"""
+          MERGE INTO jobs AS u
+            USING (
+              with qjson as (select y.*, 
+                  FIRST_VALUE(distance) OVER (ORDER BY linha ASC ) AS first_distance,
+                  FIRST_VALUE(distance) OVER (ORDER BY linha DESC ) AS last_distance,
+                  FIRST_VALUE(duration) OVER (ORDER BY linha ASC ) AS first_duration,
+                  FIRST_VALUE(duration) OVER (ORDER BY linha DESC ) AS last_duration
+                  FROM (
+                          SELECT ROW_NUMBER() over() linha, x.*
+                          FROM 
+                              jsonb_to_recordset('{geoJson}') 
+                              AS x(
+                                  duration NUMERIC,
+                                  distance NUMERIC
+                              )) y order by 1),
+            q1 as (
+            select 
+              ROW_NUMBER() over() linha, j.*
+            from (
+            select j.client_id, j.job_id, a.geocode_lat, a.geocode_long, j.actual_start_date,
+            bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date)) AS null_distance,
+            bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date)) AS null_geo
+          FROM jobs j
+            JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+            JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+            JOIN resources r on r.client_id = j.client_id AND r.resource_id = j.resource_id
+            WHERE j.actual_start_date >= cast(:p_date as date) 
+              AND j.actual_start_date < cast(:p_date as date) + interval '1 day'
+              AND js.internal_code_status = 'CONCLU'
+              and j.actual_start_date is not null
+              AND j.client_id = :client_id
+              AND j.resource_id = :resource_id
+            order by j.actual_start_date) j),
+            qjob as (
+              select * from q1 
+                where null_distance = true
+                  AND null_geo = false )
+            SELECT b.client_id, b.job_id, a.distance, a.duration, last_distance, last_duration, first_distance, last_distance
+            FROM qjson a
+            join qjob b on b.linha = a.linha
+        """).bindparams(client_id=clientId, p_date=pDate, resource_id = resourceId)
+
+        result = await db.execute(smtp)
+        await db.commit()
+      
 
 async def getStyle(r):
     logger.warning("[getStyle] Entrou atualização de estilos...")
@@ -840,12 +1009,12 @@ async def getJobs(r):
             result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
             await db.commit()
             for row in result:
-              setSnap = True
+              # setSnap = True
               logger.info(f"ID: {row.address_id} | Ação ADDRESS realizada: {row.merge_action}")
 
-          if setSnap:
-            snapKey = f'snapAddressTime:{settings.client_uid}'
-            await r.set(snapKey, first_snap)
+          # if setSnap:
+          #   snapKey = f'snapAddressTime:{settings.client_uid}'
+          #   await r.set(snapKey, first_snap)
 
            #Criação e atualização do Job
           stmt = text(f"""
@@ -1070,6 +1239,10 @@ async def processo_em_background_longo(r):
     try:
         while True:
             try:
+                await deleteJobs()
+                await asyncio.sleep(0.5)
+                await calDistance()
+                await asyncio.sleep(0.5)
                 await getPriority(r)
 
                 if consecutive_failures > 0:

@@ -342,6 +342,12 @@ class Jobs(Base):
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
     time_overlap = Column(Integer, nullable=True)
+    distance = Column(Integer, nullable=True)
+    time_distance = Column(Integer, nullable=True)
+    first_distance = Column(Integer, nullable=True)
+    first_time_distance = Column(Integer, nullable=True)
+    last_distance = Column(Integer, nullable=True)
+    last_time_distance = Column(Integer, nullable=True)
     work_duration = Column(Integer, nullable=True)
     plan_start_date = Column(DateTime, nullable=False)
     plan_end_date = Column(DateTime, nullable=False)
@@ -395,8 +401,9 @@ class Jobs(Base):
             ),
             UniqueConstraint('client_id','job_id','client_job_id', name='uk_jobs'),
             Index('idx_jobs_00', 'client_job_id','client_id'),
-            Index('idx_jobs_01', 'modified_date','client_id')
-        )
+            Index('idx_jobs_01', 'modified_date','client_id'),
+            Index('idx_jobs_lateral_perf', 'client_id', 'team_id', 'resource_id', 'job_status_id', text('actual_start_date DESC'))
+    )
 
 class Simulation(Base):
     __tablename__ = "simulation"
@@ -478,11 +485,6 @@ class SimulationJobs(Base):
                 ['client_id', 'simulation_id'],
                 ['simulation.client_id', 'simulation.simulation_id'],
                 name='fk_simulation_jobs_simulation'
-            ),
-            ForeignKeyConstraint(
-                ['client_id', 'job_id'],
-                ['jobs.client_id', 'jobs.job_id'],
-                name='fk_simulation_jobs_jobs'
             ),
             UniqueConstraint('client_id','simulation_id','client_job_id', name='uk_simulation_jobs'),
         )

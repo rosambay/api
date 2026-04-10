@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     admin: str 
     passwd: str
     client_uid: int
+    mapbox_key: str
     vroom_url: str = "https://routes.imagineit.com.br/routing"
 
     class Config:

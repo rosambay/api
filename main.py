@@ -1,3 +1,4 @@
+import uuid
 import asyncio
 import redis.asyncio as Redis
 import database
@@ -19,111 +20,7 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from config import settings
 from loguru import logger
-import httpx
-
-async def optimize_routes_vroom(payload: dict) -> dict:
-    logger.debug(
-        "VROOM request | vehicles={} jobs={}",
-        len(payload.get("vehicles", [])),
-        len(payload.get("jobs", [])),
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                settings.vroom_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-
-        if response.status_code != 200:
-            logger.error(
-                "VROOM HTTP {} | url={} | body={}",
-                response.status_code,
-                settings.vroom_url,
-                response.text[:2000],
-            )
-            response.raise_for_status()
-
-        result = response.json()
-
-        unassigned = result.get("unassigned", [])
-        routes     = result.get("routes", [])
-        logger.info(
-            "VROOM ok | routes={} unassigned={}",
-            len(routes),
-            len(unassigned),
-        )
-        if unassigned:
-            logger.warning("VROOM unassigned jobs: {}", [u.get("id") for u in unassigned])
-
-        return result
-
-    except httpx.TimeoutException as exc:
-        logger.error("VROOM timeout (60s) | url={} | {}", settings.vroom_url, exc)
-        raise
-
-    except httpx.ConnectError as exc:
-        logger.error("VROOM connection error | url={} | {}", settings.vroom_url, exc)
-        raise
-
-    except httpx.HTTPStatusError as exc:
-        logger.error(
-            "VROOM HTTP error {} | url={} | response={}",
-            exc.response.status_code,
-            settings.vroom_url,
-            exc.response.text[:2000],
-        )
-        raise
-
-    except Exception as exc:
-        logger.exception("VROOM unexpected error | url={} | {}", settings.vroom_url, exc)
-        raise
-
-
-async def get_route_distance(coordinates: List[List[float]]) -> dict:
-    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
-    url = f"https://routes.imagineit.com.br/routes/route/v1/driving/{coords_str}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(url, params={"overview": "false"})
-        response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise ValueError(f"OSRM retornou erro: {data.get('code')}")
-
-    distance_meters = data["routes"][0]["distance"]
-    distance_time = data["routes"][0]["duration"]
-    return {
-        "distance_meters": distance_meters,
-        "distance_km": round(distance_meters / 1000, 3),
-        "distance_time": distance_time,
-        "distance_time_minutes": round(distance_time / 60, 2)
-    }
-
-from typing import List
-
-async def get_route_distance_block(coordinates: List[List[float]]) -> List[dict]:
-    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
-    url = f"https://routes.imagineit.com.br/routes/route/v1/driving/{coords_str}?overview=false"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(url, params={"overview": "false"})
-        response.raise_for_status()
-
-    # Extrai o JSON
-    data = response.json()
-
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise ValueError(f"OSRM retornou erro: {data.get('code')}")
-
-    # USA A VARIÁVEL 'data' E NÃO A 'response'
-    legs = data['routes'][0]['legs']
-
-    # 'legs' já é uma lista de dicionários, pode retornar direto
-    return legs
+from services import optimize_routes_vroom, get_route_distance_block
 
 async def cleanSessionsRedis(r: Redis, session_web_id: str):
     # await r.delete(f"session:{session_web_id}")
@@ -308,7 +205,7 @@ async def login(form_data: schemas.LoginRequest, request: Request, r: Redis = De
     logger.info(f"Gerando token de acesso para usuário: {userDb.user_name} (userId: {userDb.user_id}) no domínio: {clientDomain}")
     access_token = create_access_token(data=dataToken)
     logger.info(f"Login successful for user: {userDb.user_name} in domain: {clientDomain}")
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "token_type": "bearer", "session": uuid.uuid4()}
 
 # Rota protegida
 
@@ -364,7 +261,6 @@ async def getStyles(
     stylesDb = result.scalars().all()
 
     return stylesDb
-
 
 @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
 async def getResourceWindows(
@@ -464,6 +360,9 @@ async def getJobsResources(
     userName = current_user["userName"]
     clientId = current_user["clientId"]
 
+    
+    # for r in geoResult:
+    #    print(r)
     try:
         # Tenta executar uma query simples no banco
         smtp = text("""
@@ -489,6 +388,8 @@ async def getJobsResources(
             a.state_prov, 
             a.zippost, 
             a.time_setup,
+            j.distance,
+            j.time_distance,
             p.trade_name, 
             p.cnpj,
             j.time_setup, 
@@ -529,7 +430,6 @@ async def getJobsResources(
     except Exception as e:
         logger.error(f"[getJobsResources] Erro ao conectar no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
-
 
 @app.get("/openjobs")
 async def getOpenJobs(
@@ -631,7 +531,6 @@ async def clearScheduleJobs(
     await db.execute(smtp)
     await db.commit()
     return []
-
 
 @app.post("/schedulejobs")
 async def scheduleJobs(
@@ -2126,6 +2025,7 @@ async def getSimulationEstimatedTimeJobs(
           rId = 1
         geo.append([row.geocode_long,row.geocode_lat])
       geo.append([geocode_long_at,geocode_lat_at])
+      print(geo)
       geoResult = await get_route_distance_block(geo)
       endDate = None
       distanceEnd = 0
@@ -2505,19 +2405,20 @@ async def getSimulationBestRouteJobs(
             --WHERE ordem_job = 1
                 ),
               vehicles_data AS (
-                select 
+                select
                   r.resource_id,
                   r.description,
                   r.geocode_lat_from::NUMERIC,
                   r.geocode_long_from::NUMERIC,
                   r.geocode_lat_at::NUMERIC,
-                  r.geocode_long_at::NUMERIC, 
+                  r.geocode_long_at::NUMERIC,
                   EXTRACT(EPOCH FROM rw.start_time) ::INTEGER AS start_time,
                   EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end ) ::INTEGER AS end_time
                 from resources r
                   join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
                   join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
                   join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM CAST(:p_date AS DATE)) + 1
+                  join simulation_resources sr on sr.client_id = r.client_id and sr.resource_id = r.resource_id and sr.simulation_id = :simulation_id
                   where r.client_id = :client_id
                     and t.team_id = :team_id
               ),
@@ -2587,12 +2488,12 @@ async def getSimulationBestRouteJobs(
       for route in routes:
         resourceId = int(route['vehicle'])
         logger.info(f"Resource id ...{resourceId}")
-        print(route)
+        # print(route)
         steps = route['steps']
-        print(steps)
-        print("=======================================")
+        # print(steps)
+        # print("=======================================")
         jobs = [step for step in steps if step.get('type') == 'job']
-        print(jobs)
+        # print(jobs)
         for job in jobs:
             jobId = int(job['id'])
             logger.info(f"Job id ...{jobId}")
@@ -2614,11 +2515,11 @@ async def getSimulationBestRouteJobs(
       for route in routes:
         resourceId = int(route['vehicle'])
         logger.info(f"Resource ... {route['vehicle']}")
-        print(route)
+        # print(route)
         steps = route['steps']
         somente_jobs = [step for step in steps]
         jsonJobs = json.dumps(somente_jobs)
-        print(jsonJobs)
+        # print(jsonJobs)
         smtp = text(f""" 
               with qjson as (
               SELECT 
@@ -2654,8 +2555,8 @@ async def getSimulationBestRouteJobs(
               SELECT   j.client_id,
                       j.job_id,
                       r.time_overlap,
-                      a.geocode_lat::NUMERIC AS geocode_lat,
-                      a.geocode_long::NUMERIC AS geocode_long,
+                      a.geocode_lat,
+                      a.geocode_long,
                       r.geocode_lat_from,
                       r.geocode_long_from,
                       r.geocode_lat_at,
@@ -2675,7 +2576,8 @@ async def getSimulationBestRouteJobs(
                       JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
                       JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
                       JOIN resources r ON r.client_id = j.client_id AND r.resource_id = sj.resource_id
-                      JOIN q1 on q1.geocode_lat = a.geocode_lat::NUMERIC and q1.geocode_long = a.geocode_long::NUMERIC
+                      --JOIN q1 on q1.geocode_lat = a.geocode_lat::NUMERIC and q1.geocode_long = a.geocode_long::NUMERIC
+                      JOIN q1 on q1.job_id = sj.job_id
                       CROSS JOIN q2
                       CROSS JOIN q3
                   WHERE sj.client_id = :client_id
@@ -2693,19 +2595,20 @@ async def getSimulationBestRouteJobs(
         arrivalEnd = None
         for row in rows:
           if rId is None:
-            geo.append([row.geocode_long_from,row.geocode_lat_from])
+            geo.append([float(row.geocode_long_from),float(row.geocode_lat_from)])
             geocode_long_at = row.geocode_long_at
             geocode_lat_at = row.geocode_lat_at
             arrivalStart = row.arrival_start
             arrivalEnd = row.arrival_end
             rId = 1
-          geo.append([row.geocode_long,row.geocode_lat])
-        geo.append([geocode_long_at,geocode_lat_at])
-        print(geo)
+          geo.append([float(row.geocode_long),float(row.geocode_lat)])
+        geo.append([float(geocode_long_at),float(geocode_lat_at)])
+        
         geoResult = await get_route_distance_block(geo)
-        simulatedWindowEndDate = None
-        simulatedWindowDistanceEnd = 0
-        simulatedWindowTimeDistanceEnd = 0
+        print(json.dumps(geoResult))
+        endDate = None
+        distanceEnd = 0
+        timeDistanceEnd = 0
         vArrivalBefore = None
         totalOverlap = 0
         rOrder = 1
@@ -2716,13 +2619,7 @@ async def getSimulationBestRouteJobs(
           vArrival = row.arrival
           vSetup = row.setup
           vService = row.time_service
-          logger.info(f"Otimizando recurso {resourceId} - Job {jobId} , arrival: {vArrival} - arrival before: {vArrivalBefore} - Overlap - {row.time_overlap} total overlap {totalOverlap}")
-          if vArrivalBefore == vArrival:
-            totalOverlap += row.time_overlap
-            vArrival = vArrival + totalOverlap
-          else:
-            vArrivalBefore = vArrival
-            totalOverlap = 0
+          # logger.info(f"Otimizando recurso {resourceId} - Job {jobId} , arrival: {vArrival} - arrival before: {vArrivalBefore} - Overlap - {row.time_overlap} total overlap {totalOverlap}")
 
           vDtStart = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=vArrival)
           vDtEnd = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=vArrival + vSetup + vService)
@@ -2757,10 +2654,11 @@ async def getSimulationBestRouteJobs(
         timeDistanceEnd = round(geoResult[(rOrder-1)]["duration"])
         distanceStart = round(geoResult[(0)]["distance"])
         timeDistanceStart = round(geoResult[(0)]["duration"])
+
+        endDate = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=arrivalEnd)
+        startDate = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=arrivalStart)
         
-        todayZero = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        endDate = todayZero + timedelta(seconds=arrivalEnd)
-        startDate = todayZero + timedelta(seconds=arrivalStart)
+        logger.info(f"Valores - resource_id: {resourceId} - {distanceEnd} - {timeDistanceEnd} - {distanceStart} - {timeDistanceStart} - {endDate} - {startDate}")        
 
         await db.execute(
           update(models.SimulationResources)
@@ -2787,6 +2685,7 @@ async def getSimulationBestRouteJobs(
             select 
               :type as type,
               j.job_id,
+              j.simulation_id,
               j.client_job_id,
               j.team_id, 
               j.resource_id, 
@@ -2833,6 +2732,7 @@ async def getSimulationBestRouteJobs(
               )
         select
             q1.type,
+            q1.simulation_id,
             q1.team_id,
             q1.resource_id,
             q1.resource_distance_end,
@@ -2843,7 +2743,7 @@ async def getSimulationBestRouteJobs(
             q1.resource_time_distance_start,
             jsonb_agg(to_jsonb(q1) ORDER BY q1.simulated_window_order) AS resources
           from q1
-          group by q1.type, q1.team_id,
+          group by q1.type, q1.simulation_id, q1.team_id,
             q1.resource_id,
             q1.resource_distance_end,
             q1.resource_end_date,
@@ -2858,9 +2758,140 @@ async def getSimulationBestRouteJobs(
     rows = result.mappings().all()
 
     res = [dict(row) for row in rows]
-    logger.info('Finalizou terceira consulta...')             
-    return res       
+    logger.info('Finalizou terceira consulta...')
+    return res
 
+@app.post("/simulationcomparison")
+async def getSimulationComparison(
+    body: schemas.SimulationComparisonRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(database.get_db),
+):
+    p_date         = body.p_date
+    simulationIds  = body.simulation_ids
+    clientId       = current_user["clientId"]
+
+    if not simulationIds:
+        raise HTTPException(status_code=400, detail="simulation_ids não pode ser vazio.")
+
+    logger.info(f"Relatório comparativo: client_id={clientId}, p_date={p_date}, simulation_ids={simulationIds}")
+    
+    sim_ids_literal = ','.join(str(s) for s in simulationIds)
+
+    if len(simulationIds) > 1:
+        smtp = text(f"""
+          DELETE
+            FROM simulation_resources a
+          WHERE a.client_id = :client_id
+            AND a.simulation_id IN ({sim_ids_literal})
+            AND NOT EXISTS (
+                SELECT 1 
+                FROM simulation_jobs b 
+                WHERE a.simulation_id = b.simulation_id 
+                  AND a.resource_id = b.resource_id
+            )
+            AND a.resource_id IN (
+                SELECT resource_id
+                FROM simulation_resources
+                WHERE client_id = :client_id
+                  AND simulation_id IN ({sim_ids_literal})
+                GROUP BY resource_id
+                HAVING COUNT(DISTINCT simulation_id) = 1
+            );
+            """).bindparams(client_id=clientId)
+        await db.execute(smtp)
+        await db.commit()
+
+    smtp = text(f"""
+        WITH simulations_active AS (
+            SELECT s.simulation_id, s.sequence
+            FROM simulation s
+            WHERE s.client_id     = :client_id
+              AND s.simulation_id IN ({sim_ids_literal})
+        ),
+        actual_by_resource AS (
+            SELECT
+                j.resource_id,
+                COUNT(j.job_id)::INTEGER                                                          AS jobs_count,
+                MIN(j.actual_start_date)                                                          AS start_date,
+                MAX(j.actual_end_date)                                                            AS end_date,
+                EXTRACT(EPOCH FROM (MAX(j.actual_end_date) - MIN(j.actual_start_date)))::INTEGER  AS duration_seconds,
+                SUM(j.distance)::INTEGER                                                          AS actual_distance,
+                SUM(j.time_distance)::INTEGER                                                     AS actual_time_distance
+            FROM jobs j
+            JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+            WHERE j.client_id  = :client_id
+              AND j.actual_start_date >= cast(:p_date AS date)
+              AND j.actual_start_date  < cast(:p_date AS date) + interval '1 day'
+              AND js.internal_code_status = 'CONCLU'
+              AND EXISTS (
+                  SELECT 1 FROM simulation_resources sr2
+                  JOIN simulations_active sa2 ON sa2.simulation_id = sr2.simulation_id
+                  WHERE sr2.client_id = j.client_id AND sr2.resource_id = j.resource_id
+              )
+            GROUP BY j.resource_id
+        ),
+        sim_jobs_count AS (
+            SELECT
+                sj.simulation_id,
+                sj.resource_id,
+                COUNT(sj.job_id)::INTEGER AS jobs_count
+            FROM simulation_jobs sj
+            JOIN simulations_active sa ON sa.simulation_id = sj.simulation_id
+            WHERE sj.client_id = :client_id
+            GROUP BY sj.simulation_id, sj.resource_id
+        )
+        SELECT
+            r.resource_id,
+            r.client_resource_id,
+            r.description,
+            json_agg(
+                json_build_object(
+                    'simulation_id',       sa.simulation_id,
+                    'sequence',            sa.sequence,
+                    'jobs_count',          COALESCE(sjc.jobs_count, 0),
+                    'distance_start',      sr.distance_start,
+                    'distance_end',        sr.distance_end,
+                    'time_distance_start', sr.time_distance_start,
+                    'time_distance_end',   sr.time_distance_end,
+                    'start_date',          sr.start_date,
+                    'end_date',            sr.end_date
+                ) ORDER BY sa.sequence
+            ) AS simulations,
+            abr.jobs_count        AS actual_jobs_count,
+            abr.start_date        AS actual_start_date,
+            abr.end_date          AS actual_end_date,
+            abr.duration_seconds  AS actual_duration_seconds,
+            abr.actual_distance   AS actual_distance,
+            abr.actual_time_distance AS actual_time_distance
+        FROM resources r
+        JOIN simulation_resources sr
+            ON  sr.client_id   = r.client_id
+            AND sr.resource_id = r.resource_id
+        JOIN simulations_active sa
+            ON  sa.simulation_id = sr.simulation_id
+        LEFT JOIN sim_jobs_count sjc
+            ON  sjc.simulation_id = sr.simulation_id
+            AND sjc.resource_id   = r.resource_id
+        LEFT JOIN actual_by_resource abr
+            ON  abr.resource_id = r.resource_id
+        WHERE r.client_id = :client_id
+        GROUP BY
+            r.resource_id,
+            r.client_resource_id,
+            r.description,
+            abr.jobs_count,
+            abr.start_date,
+            abr.end_date,
+            abr.duration_seconds,
+            abr.actual_distance,
+            abr.actual_time_distance
+        ORDER BY r.description
+    """).bindparams(client_id=clientId, p_date=p_date)
+
+    result = await db.execute(smtp)
+    rows = result.mappings().all()
+    return [dict(row) for row in rows]
 
 @app.get("/simulationjobs")
 async def getSimulationJobs(
@@ -3580,8 +3611,6 @@ async def getSimulationJobs(
       logger.info('Finalizou terceira consulta...')
       return res
       # return vroom_payload
-
-
 
 # ROTAS DE RESOURCES
 

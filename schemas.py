@@ -7,10 +7,12 @@ class LoginRequest(BaseModel):
     domain: str
     user: str
     pwd: str
+    
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+    session: UUID4
 
 class ViewClientResponse(BaseModel):
     client_id: int
@@ -77,6 +79,10 @@ class SimulationBestRouteJobsRequest(BaseModel):
     team_id: int
     p_date: str
     type: str # pode ser BRAC - Best Resources Actual,  BRAA Best Resrouces All Actual
+
+class SimulationComparisonRequest(BaseModel):
+    p_date: str
+    simulation_ids: List[int]
 
 class ClearScheduleJobsRequest(BaseModel):
     resource_id: int
