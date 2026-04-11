@@ -80,6 +80,10 @@ class SimulationBestRouteJobsRequest(BaseModel):
     p_date: str
     type: str # pode ser BRAC - Best Resources Actual,  BRAA Best Resrouces All Actual
 
+class HistoryBestRouteJobsRequest(BaseModel):
+    team_id: int
+    p_date: str
+
 class SimulationComparisonRequest(BaseModel):
     p_date: str
     simulation_ids: List[int]

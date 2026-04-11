@@ -405,6 +405,27 @@ class Jobs(Base):
             Index('idx_jobs_lateral_perf', 'client_id', 'team_id', 'resource_id', 'job_status_id', text('actual_start_date DESC'))
     )
 
+class Reports(Base):
+    __tablename__ = "reports"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, primary_key=True, nullable=False)
+    report_id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, nullable=False)
+    report_date = Column(Date, nullable=False)
+    report = Column(JSONB, nullable=True)
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+    __table_args__ = (
+            ForeignKeyConstraint(
+                ['client_id', 'team_id'],
+                ['teams.client_id', 'teams.team_id'],
+                name='fk_reports_teams'
+            ),
+            UniqueConstraint('client_id','team_id', 'report_date', name='uk_reports'),
+        )    
 class Simulation(Base):
     __tablename__ = "simulation"
 
