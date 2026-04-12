@@ -1,8 +1,14 @@
 import httpx
+import inspect
 from typing import List
 from loguru import logger
 from config import settings
-
+from database import SessionLocal
+from sqlalchemy import text, update, delete, exists
+import models, schemas
+import json
+from collections.abc import Mapping
+from datetime import datetime, timedelta, date
 
 async def optimize_routes_vroom(payload: dict) -> dict:
     logger.debug(
@@ -123,4 +129,48 @@ async def get_route_distance_block(coordinates: List[List[float]]) -> List[dict]
         raise ValueError(f"OSRM retornou erro: {data.get('code')}")
 
     legs = data['routes'][0]['legs']
+
+    logger.info("Finalizou Block Distance")
     return legs
+
+
+def serializador_customizado(obj):
+    # Se for data ou data/hora, usa o formato ISO
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    # Se for outro tipo desconhecido, gera erro (comportamento padrão)
+    raise TypeError(f"Tipo {type(obj)} não é serializável")
+
+async def logs(clientId: int, log: str, userId: int = None, logJson: dict | str | list | None = None):
+    # --- O PORTEIRO ---
+    if isinstance(logJson, str):
+        # 1. Se for texto puro, converte pra objetos Python
+        dado_limpo = json.loads(logJson)
+        
+    elif isinstance(logJson, Mapping):
+        # Chegou Dicionário ou RowMapping do SQLAlchemy:
+        dict_bruto = dict(logJson)
+        
+        # A MÁGICA AQUI: "Lava" o dicionário para remover objetos datetime
+        # Transforma em string (resolvendo as datas) e volta para dict
+        json_string = json.dumps(dict_bruto, default=serializador_customizado)
+        dado_limpo = json.loads(json_string)
+        
+    else:
+        # 3. Se for uma lista pura ou None, passa direto
+        dado_limpo = logJson
+    # ------------------
+    autor = str(userId) if userId else 'system'
+
+
+    async with SessionLocal() as db:
+        newSimulation = models.Logs(
+            client_id = clientId,
+            log_date = datetime.now(), 
+            log_type = inspect.stack()[1].function,
+            log = log,
+            log_json = dado_limpo,
+            created_by = autor
+        )
+        db.add(newSimulation)
+        await db.commit()

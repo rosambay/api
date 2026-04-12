@@ -93,6 +93,8 @@ class Teams(Base):
     team_name = Column(String(128), nullable=False)
     time_setup = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
+    start_time = Column(Time, nullable=False, server_default=text("'08:00:00'"))
+    end_time = Column(Time, nullable=False, server_default=text("'18:00:00'"))
     geocode_lat = Column(String(32), nullable=True)
     geocode_long = Column(String(32), nullable=True)    
     created_by = Column(String(32), nullable=False)
@@ -402,7 +404,10 @@ class Jobs(Base):
             UniqueConstraint('client_id','job_id','client_job_id', name='uk_jobs'),
             Index('idx_jobs_00', 'client_job_id','client_id'),
             Index('idx_jobs_01', 'modified_date','client_id'),
-            Index('idx_jobs_lateral_perf', 'client_id', 'team_id', 'resource_id', 'job_status_id', text('actual_start_date DESC'))
+            Index('idx_jobs_start_date_desc', 'client_id', 'team_id', 'resource_id', 'job_status_id', text('actual_start_date DESC')),
+            Index('idx_jobs_start_date_actual_plan', 'client_id', 'team_id', 'resource_id', 'job_status_id', 'actual_start_date', 'plan_start_date'),
+            Index('idx_jobs_start_date', text('COALESCE(actual_start_date, plan_start_date)')),
+            Index('idx_jobs_performance_composite', 'client_id', 'team_id', 'job_status_id')
     )
 
 class Reports(Base):
@@ -414,6 +419,7 @@ class Reports(Base):
     team_id = Column(Integer, nullable=False)
     report_date = Column(Date, nullable=False)
     report = Column(JSONB, nullable=True)
+    rebuild = Column(Integer, nullable=False, server_default=text("0"))
     created_by = Column(String(32), nullable=False)
     created_date = Column(DateTime, nullable=False)
     modified_by = Column(String(32), nullable=False)
@@ -425,6 +431,7 @@ class Reports(Base):
                 name='fk_reports_teams'
             ),
             UniqueConstraint('client_id','team_id', 'report_date', name='uk_reports'),
+            Index('idx_reports_client_rebuild', 'client_id', 'rebuild','team_id', 'report_date')
         )    
 class Simulation(Base):
     __tablename__ = "simulation"
@@ -557,3 +564,16 @@ class SimulationResources(Base):
                 name='fk_simulation_jobs_resources'
             )
         )    
+    
+
+class Logs(Base):
+    __tablename__ = "logs"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, ForeignKey("clients.client_id"), primary_key=True, nullable=False)
+    log_id = Column(Integer, primary_key=True, autoincrement=True)
+    log_date = Column(DateTime, nullable=False)
+    log_type = Column(String(64), nullable=False)
+    log = Column(Text, nullable=True)
+    log_json = Column(JSONB, nullable=True)
+    created_by = Column(String(32), nullable=False)

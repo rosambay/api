@@ -412,6 +412,7 @@ async def getJobsResources(
             left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
             where ut.client_id = :client_id
               and ut.user_id = :user_id
+              --and (js.internal_code_status <> 'CONCLU' OR js.internal_code_status IS NULL)
               and (
                     (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
                   or (
@@ -2196,7 +2197,8 @@ async def getHistoryBestRouteJobs(
 
     result = await db.execute(smtp)
     rows = result.mappings().all()
-
+    if not rows or len(rows)==0:
+       return []
     res = rows[0]['report']
     logger.info('Finalizou terceira consulta...')
     return res
