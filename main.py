@@ -548,6 +548,21 @@ async def scheduleJobs(
     userName = current_user["userName"]
     clientId = current_user["clientId"]
 
+    smtp = text("""
+        SELECT 
+            job_id 
+          FROM jobs j
+            JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+         WHERE j.client_id = :client_id
+            AND j.team_id = :team_id
+            AND a.geocode_lat is not null
+            AND a.geocode_long is not null
+            and (a.geocode_lat::NUMERIC) < 100
+            AND (a.geocode_long::NUMERIC) < 100
+            limit 1
+               """)
+
+
     logger.info(f"""Parâmetros: action - {action} resource_id - {resourceId}, simulation_id - {simulationId}, jobs - ({listJobs}),  p_date - {p_date}""")
     jobExists = True
     if action == 'I':
@@ -2175,34 +2190,6 @@ async def getSimulationEstimatedTimeJobs(
     logger.info('Finalizou terceira consulta...')             
     return res       
 
-@app.post("/historybestroutejobs")
-async def getHistoryBestRouteJobs(
-    body: schemas.HistoryBestRouteJobsRequest,
-    current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(database.get_db),
-):
-    teamId = body.team_id
-    p_date = body.p_date
-    userId = current_user["userId"]
-    userName = current_user["userName"]
-    clientId = current_user["clientId"]
-    
-    smtp = text(f"""
-        select report 
-          from reports
-         where client_id = :client_id
-           and team_id = :team_id
-           and report_date = CAST(:p_date AS DATE)
-      """).bindparams(client_id=clientId, team_id = teamId, p_date = p_date)
-
-    result = await db.execute(smtp)
-    rows = result.mappings().all()
-    if not rows or len(rows)==0:
-       return []
-    res = rows[0]['report']
-    logger.info('Finalizou terceira consulta...')
-    return res
-
 @app.post("/simulationcomparison")
 async def getSimulationComparison(
     body: schemas.SimulationComparisonRequest,
@@ -3055,7 +3042,6 @@ async def getSimulationJobs(
       # return vroom_payload
 
 # ROTAS DE RESOURCES
-
 @app.patch("/resources/{resource_id}", response_model=schemas.ResourceUpdateResponse)
 async def updateResource(
     resource_id: int,
@@ -3091,8 +3077,6 @@ async def updateResource(
     await db.refresh(resource)
 
     return resource
-
-
 
 @app.post("/simulationbestroutejobs")
 async def getSimulationBestRouteJobs(
@@ -3681,3 +3665,95 @@ async def getSimulationBestRouteJobs(
     logger.info('Finalizou terceira consulta...')
     return res
 
+# Reports
+@app.post("/historybestroutejobs")
+async def getHistoryBestRouteJobs(
+    body: schemas.HistoryBestRouteJobsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(database.get_db),
+):
+    teamId = body.team_id
+    p_date = body.p_date
+    userId = current_user["userId"]
+    userName = current_user["userName"]
+    clientId = current_user["clientId"]
+    
+    smtp = text(f"""
+        select report 
+          from reports
+         where client_id = :client_id
+           and team_id = :team_id
+           and report_date = CAST(:p_date AS DATE)
+      """).bindparams(client_id=clientId, team_id = teamId, p_date = p_date)
+
+    result = await db.execute(smtp)
+    rows = result.mappings().all()
+    if not rows or len(rows)==0:
+       return []
+    res = rows[0]['report']
+    logger.info('Finalizou terceira consulta...')
+    return res
+
+@app.post("/bestroutejobsbydate")
+async def getBestRouteJobsByDate(
+    body: schemas.BestRouteJobsByDateRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(database.get_db),
+):
+    teamId = body.team_id
+    p_start_date = body.p_start_date
+    p_end_date = body.p_end_date
+    userId = current_user["userId"]
+    userName = current_user["userName"]
+    clientId = current_user["clientId"]
+    
+    smtp = text(f"""
+        WITH raw_data AS (
+            SELECT report AS doc, team_id, report_date 
+            from reports
+            where client_id = :client_id
+              and team_id = :team_id
+            and report_date between CAST(:p_start_date AS DATE) and CAST(:p_end_date AS DATE)
+                
+        ),
+        dados as (
+        SELECT 
+            (rep->>'type')::varchar AS report_type,
+            team_id,
+            report_date,
+
+            (res->>'client_id')::int AS client_id,
+            (res->>'resource_id')::int AS resource_id,
+            (res->>'job_day')::timestamp AS res_job_day,
+            (res->>'total_jobs')::int AS total_jobs,
+            (res->>'total_distance')::numeric AS total_distance,
+            (res->>'total_time_distance')::numeric AS total_time_distance
+
+        FROM raw_data,
+        -- 1. Expande a lista de tipos de relatório (REAL, BRAC, etc)
+        LATERAL jsonb_array_elements(doc->'reports') AS rep,
+        -- 2. Expande a lista de recursos dentro de cada relatório
+        LATERAL jsonb_array_elements(rep->'resources') AS res)
+        select 
+          team_id
+        , report_type
+        , report_date
+        ,  sum(total_distance) as total_distance
+        ,  sum(total_time_distance) as total_time_distance
+        ,  sum(total_jobs) as total_jobs
+        from (select * from dados)
+        group by 1,3,2
+        order by 1,3,2
+
+
+      """).bindparams(client_id=clientId, team_id = teamId, p_start_date = p_start_date, p_end_date = p_end_date)
+
+    result = await db.execute(smtp)
+    rows = result.mappings().all()
+    
+    if not rows or len(rows)==0:
+       return []
+    
+    res = [dict(row) for row in rows]
+    return res
+    

@@ -84,6 +84,11 @@ class HistoryBestRouteJobsRequest(BaseModel):
     team_id: int
     p_date: str
 
+class BestRouteJobsByDateRequest(BaseModel):
+    team_id: int
+    p_start_date: str
+    p_end_date: str
+
 class SimulationComparisonRequest(BaseModel):
     p_date: str
     simulation_ids: List[int]

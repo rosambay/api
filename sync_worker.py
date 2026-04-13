@@ -28,7 +28,7 @@ def oneHour(dateTime: str):
 
 async def deleteJobs():
     
-    tempDateTime = (datetime.now() - timedelta(days=7))
+    tempDateTime = (datetime.now() - timedelta(days=15))
     pDate = tempDateTime.strftime('%Y-%m-%d')
     #vamos verificar se existe alguma tarefa concluida sem distância calculada
     async with SessionLocal() as db:
@@ -60,6 +60,7 @@ async def buildReports():
                 WHERE js.internal_code_status = 'CONCLU'
                     AND j.client_id = 1
                     AND j.team_id = 33
+                    AND COALESCE(j.actual_start_date, j.plan_start_date) < date_trunc('day',NOW())
                     AND NOT EXISTS (SELECT 
                                         1
                                     FROM reports rp
@@ -84,6 +85,7 @@ async def buildReports():
                     count(*) total 
                 from qjobs
                 group by client_id, team_id, DATE_TRUNC('day', actual_date)
+                order by 1,2,3
         """)
         output = None
         async with SessionLocal() as db:
@@ -99,7 +101,7 @@ async def buildReports():
                 braa_results = []
                 brac_results = []
                 for r in ['BRAA','BRAC']:
-                    logger.warning(f'Iniciando... {r}')
+                    logger.warning(f'Iniciando... {r} em {actualDate}')
                     vBrac = text("""
                     AND EXISTS (
                         SELECT 1 
@@ -115,8 +117,10 @@ async def buildReports():
                     
                     logger.info("Iniciado Calculo das rotas ...")
                     smtp = text(f"""
-                        WITH q1 AS (
+                        WITH dados AS (
                             SELECT j.client_id
+                                ,t.team_id
+                                ,300 time_overlap
                                 ,j.job_id
                                 ,j.address_id
                                 ,a.geocode_lat::NUMERIC geocode_lat
@@ -145,6 +149,41 @@ async def buildReports():
                             and (a.geocode_lat::NUMERIC) < 100
                             AND (a.geocode_long::NUMERIC) < 100
                             AND js.internal_code_status = 'CONCLU'
+                        ),
+                        MapeamentoEnderecos AS (
+                            SELECT 
+                                *,
+                                -- 1. Conta o total de jobs para o mesmo address_id (e client_id, por segurança)
+                                COUNT(job_id) OVER (
+                                    PARTITION BY client_id, team_id, geocode_lat, geocode_long
+                                ) AS quantidade_jobs_mesmo_endereco,
+                                
+                                -- 2. Cria um ranking ordenando pelo menor job_id
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY client_id, team_id, geocode_lat, geocode_long
+                                    ORDER BY job_id ASC
+                                ) AS ordem_job
+                            FROM dados
+                        ),
+                        list as (
+                            SELECT json_agg(job_id) AS job_id_list
+                              FROM dados
+                        ),
+                        q1 as (
+                          SELECT 
+                            client_id,
+                            team_id,
+                            job_id,
+                            address_id,
+                            geocode_lat,
+                            geocode_long,
+                            time_setup,
+                            time_service + (time_overlap * (quantidade_jobs_mesmo_endereco -1)) as time_service,
+                            priority,
+                            start_time,
+                            end_time
+                          FROM MapeamentoEnderecos
+                          WHERE ordem_job = 1
                         ),
                         vehicles_data AS (
                             select
@@ -194,7 +233,8 @@ async def buildReports():
                         )
                         SELECT json_build_object(
                             'vehicles', (SELECT array_vehicles FROM vehicles_json),
-                            'jobs', (SELECT array_jobs FROM jobs_json)
+                            'jobs', (SELECT array_jobs FROM jobs_json),
+                            'list', (SELECT job_id_list FROM list)
                         ) AS vroom_payload;
                     """).bindparams(client_id=clientId, p_date = actualDate, team_id = teamId)
                     result = await db.execute(smtp)
@@ -203,9 +243,16 @@ async def buildReports():
                         return
                     await logs(clientId=clientId,log='dados para vroom',logJson=dict(subRows[0]))
                     vroom_payload = subRows[0]['vroom_payload']
+
+                    listJobs = vroom_payload.pop('list', 'Chave não encontrada')
+                    logger.info(list(listJobs))
                     
+                    # logger.info(vroom_payload)
+
                     logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
                     retorno = await optimize_routes_vroom(vroom_payload)
+                    
+
                     routes = retorno['routes']
                     for rou in routes:
                         # print(rou)
@@ -237,6 +284,11 @@ async def buildReports():
                         logger.debug(f'Lista de jobs excluidas da rota... {listIds}')
                     
                     await logs(clientId=clientId,log='retorno do vroom',logJson=retorno)
+                    
+                    # if actualDate.strftime('%Y-%m-%d') == '2026-04-10':
+                    #     return
+                    # continue
+
                     vroomResult = json.dumps(retorno)
                     smtp = text(f"""
                         WITH payload_data AS (
@@ -266,6 +318,44 @@ async def buildReports():
                             FROM rotas r,
                                 jsonb_array_elements(r.passos_array) WITH ORDINALITY AS passo(passo_json, ordem_passo)
                         ),
+                        dados_jobs as(
+                          select  j.client_id,
+                                  j.team_id,
+                                  j.job_id,
+                                  300 time_overlap,
+                                  j.client_job_id,
+                                  js.description AS status_description,
+                                  jt.description as type_description,
+                                  CASE WHEN j.job_id <>  FIRST_VALUE(job_id) OVER (PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long ORDER BY job_id ASC)
+                                  THEN FIRST_VALUE(job_id) OVER (PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long ORDER BY job_id ASC)
+                                  ELSE j.job_id
+                                 END AS new_job_id,
+                                 j.job_type_id,
+                                 j.job_status_id,
+                                 COALESCE (j.time_service, jt.time_service, t.time_service) AS time_service,
+                                 ROW_NUMBER() OVER (
+                                    PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long
+                                    ORDER BY job_id ASC
+                                ) AS ordem_job,
+                                 j.place_id,
+                                 j.address_id,
+                                 a.geocode_lat, 
+                                 a.geocode_long,
+                                 a.address, 
+                                 a.city, 
+                                 a.state_prov, 
+                                 a.zippost,
+                                 p.trade_name, 
+                                 p.cnpj
+                            from jobs j
+                            join address a on a.client_id = j.client_id and a.address_id = j.address_id
+                            join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
+                            join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+                            JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
+                            join places p on p.client_id = j.client_id and p.place_id = j.place_id
+                            where j.client_id = :client_id
+                              and j.job_id IN ({','.join(str(j) for j in listJobs)})
+                        ),
                         dados as(
                             select 
                                 r.client_id,
@@ -274,46 +364,73 @@ async def buildReports():
                                 j.team_id,
                                 j.client_job_id,
                                 r.description resource_name,
-                                js.description AS status_description,
-                                jt.description as type_description,
-                                a.address, 
-                                a.city, 
-                                a.state_prov, 
-                                a.zippost, 
-                                p.trade_name, 
-                                p.cnpj,
+                                j.status_description,
+                                j.type_description,
+                                j.address, 
+                                j.city, 
+                                j.state_prov, 
+                                j.zippost, 
+                                j.trade_name, 
+                                j.cnpj,
                                 :p_date job_day,
                                 q_1.geocode_long AS geocode_long_from,
                                 q_1.geocode_lat AS  geocode_lat_from,
                                 q_1.arrival AS arrival_from,
                                 q_3.distance AS distance_from,
                                 q_3.time_distance as time_distance_from,
-                                :p_date + (q.arrival *  INTERVAL '1 second') start_date,
-                                :p_date + ((q.arrival + q.setup + q.service) *  INTERVAL '1 second') end_date,
+                                
                                 q_2.geocode_long AS geocode_long_at,
                                 q_2.geocode_lat AS  geocode_lat_at,
                                 q_2.arrival AS arrival_at,
                                 q_2.distance AS distance_at,
                                 q_2.time_distance as time_distance_at,
-                                :p_date + ((q_1.arrival) *  INTERVAL '1 second') date_from,
-                                :p_date + ((q_2.arrival + q_2.setup + q_2.service) *  INTERVAL '1 second') date_at,
+                                
                                 j.job_id,
                                 q.geocode_long,
                                 q.geocode_lat,
-                                q.arrival,
-                                q.service,
-                                q.distance,
-                                q.time_distance
+                                q.setup,
+                                --q.arrival,
+                                j.ordem_job,
+                                CASE 
+                                  WHEN j.ordem_job > 1
+                                    THEN
+                                      q.arrival + (j.time_overlap * (j.ordem_job-1))
+                                  ELSE
+                                    q.arrival
+                                end AS arrival,
+                                j.time_service AS service,      
+                                --q.service,
+                                CASE 
+                                  WHEN j.ordem_job > 1
+                                    THEN
+                                      0
+                                  ELSE
+                                    q.distance
+                                end AS distance,
+                                --q.distance,
+                                CASE 
+                                  WHEN j.ordem_job > 1
+                                    THEN
+                                      0
+                                  ELSE
+                                    q.time_distance
+                                end AS time_distance
+                                --q.time_distance
                             from q1 q
-                            join jobs j ON j.client_id = :client_id and j.job_id = q.job_id
-                            join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-                            join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-                            join address a on a.client_id = j.client_id and a.address_id = j.address_id
-                            join places p on p.client_id = j.client_id and p.place_id = j.place_id
-                            join resources r ON r.client_id = :client_id and r.resource_id = q.resource_id
+                            join dados_jobs j ON j.client_id = 1 and j.new_job_id = q.job_id
+                            join resources r ON r.client_id = 1 and r.resource_id = q.resource_id
                             join q1 q_1 on q_1.resource_id = q.resource_id and q_1.stop_type = 'start'
                             join q1 q_2 on q_2.resource_id = q.resource_id and q_2.stop_type = 'end'
                             join q1 q_3 on q_3.resource_id = q.resource_id and q_3.stop_type = 'job' AND q_3.sequence = 2
+                        ),
+                        dados_new as (
+                          select 
+                            a.*,
+                            a.job_day + (arrival *  INTERVAL '1 second') start_date,
+                            a.job_day + ((arrival + setup + service) *  INTERVAL '1 second') end_date,
+                            a.job_day + ((arrival_from) *  INTERVAL '1 second') date_from,
+                            a.job_day + ((arrival_at) *  INTERVAL '1 second') date_at
+                           from dados a
                         ),
                         grp as (
                             select 
@@ -362,7 +479,7 @@ async def buildReports():
                                 sum(q.distance) + max(q.distance_at) as total_distance,
                                 sum(q.time_distance) + max(q.time_distance_at) as total_time_distance,
                                 count(q.job_id) total_jobs
-                            from dados q
+                            from dados_new q
                             GROUP BY  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
                         )
                         select
@@ -456,6 +573,10 @@ async def buildReports():
                         WHERE COALESCE(j.actual_start_date,j.plan_start_date) >= :p_date
                             AND COALESCE(j.actual_start_date,j.plan_start_date) < :p_date + interval '1 day'
                             AND js.internal_code_status = 'CONCLU'
+                            AND a.geocode_lat is not null
+                            AND a.geocode_long is not null
+                            and (a.geocode_lat::NUMERIC) < 100
+                            AND (a.geocode_long::NUMERIC) < 100
                             AND j.client_id = :client_id
                             AND j.team_id = :team_id
                     ),
@@ -468,8 +589,8 @@ async def buildReports():
                             c.job_day  + (EXTRACT(EPOCH FROM c.first_start_date::TIME)::INTEGER - c.time_distance_from) * INTERVAL '1 second' date_from,
                             c.job_day  + (EXTRACT(EPOCH FROM c.last_end_date::TIME)::INTEGER + c.time_distance_at) * INTERVAL '1 second' date_at
                         from dados c
-                        where c.null_distance = false
-                        and c.null_geo = false
+                        --where c.null_distance = false
+                        --and c.null_geo = false
                     ),
                     grp as (
                         select 
@@ -585,11 +706,11 @@ async def buildReports():
                         {"type": "BRAA", "resources": braa_results},
                     ]
                 }
-                # print(json.dumps(output))
+                print('Chegou aqui?')
                 rep_json = json.dumps(output)
                 smtp = text(f"""
                     MERGE INTO reports u
-                    USING (SELECT '{rep_json}'::jsonb as rep) as t
+                    USING (SELECT CAST(:json_data AS jsonb) as rep) as t
                     ON ( client_id = :client_id and team_id = :team_id and report_date = :report_date)
                     WHEN MATCHED THEN
                     UPDATE SET 
@@ -601,12 +722,15 @@ async def buildReports():
                         THEN        
                     INSERT (client_id, team_id, report_date, report, created_by, created_date, modified_by, modified_date)
                     VALUES (:client_id, :team_id, :report_date, t.rep, 'system', now(), 'system', now())
-                """).bindparams(
-                    client_id=clientId,
-                    team_id=teamId,
-                    report_date=actualDate
-                )
-                await db.execute(smtp)
+                """)
+                
+                parametros = {
+                    "client_id": clientId,
+                    "team_id": teamId,
+                    "report_date": actualDate,
+                    "json_data": rep_json
+                }
+                await db.execute(smtp, parametros)
                 await db.commit()
                 logger.warning(f'Reports finalizados!')
 
@@ -870,7 +994,6 @@ async def getStyle(r):
 
     return
 
-
 async def getResources(r):
     logger.warning("[getResources] Entrou atualização dos Recursos ...")
 
@@ -940,7 +1063,6 @@ async def getResources(r):
                     logger.error(f"[getResource] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getResourceWindow(r):
     logger.warning("[getResourceWindow] Entrou atualização das Janelas de Recursos ...")
@@ -1019,7 +1141,6 @@ async def getResourceWindow(r):
 
     return
 
-
 async def getAddress(r):
     logger.warning("[getAddress] Entrou atualização de Endereços ...")
 
@@ -1084,7 +1205,6 @@ async def getAddress(r):
                     logger.error(f"[getAddress] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getPlaces(r):
     logger.info("[getPlaces] Entrou atualização de Locais ...")
@@ -1467,7 +1587,7 @@ async def getJobs(r):
     snapKey = f'snapJobsTime:{settings.client_uid}'
     dateTime = await r.get(snapKey)
     if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=7))
+        tempDateTime = (datetime.now() - timedelta(days=45))
         dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
     else:
       dateTime = oneHour(dateTime)
@@ -1854,8 +1974,8 @@ async def processo_em_background_longo(r):
     try:
         while True:
             try:
-                await deleteJobs()
-                await asyncio.sleep(0.5)
+                # await deleteJobs()
+                # await asyncio.sleep(0.5)
                 await calcDistance()
                 await asyncio.sleep(0.5)
                 await buildReports()
@@ -1931,7 +2051,7 @@ async def main():
 
     try:
         await asyncio.gather(
-            processo_em_background(r),
+            #processo_em_background(r),
             processo_em_background_longo(r)
             # adicione outros workers aqui, ex: outro_processo(r),
         )
