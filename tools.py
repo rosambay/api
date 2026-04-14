@@ -750,10 +750,10 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     t.cnpj,
                     t.created_dttm, 
                     t.modified_dttm,
-                    COALESCE(t.work_duration,0) * 60 AS work_duration, -- Converte para segundos
+                    COALESCE(t.work_duration,0) * 60 AS work_duration,
                     t.plan_start_dttm,
                     t.plan_end_dttm,
-                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_task_dur_min, -- Converte para segundos
+                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_task_dur_min,
                     t.actual_start_dttm,
                     t.actual_end_dttm,
                     t.sla,
@@ -776,9 +776,20 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     pp.pt_actual_start_dttm,
                     pp.pt_actual_end_dttm,
                     pp.pt_geocode_lat,
-                    pp.pt_geocode_long                   
+                    pp.pt_geocode_long,
+                    concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
+                    p.geocode_lat as resource_geocode_lat, 
+                    p.geocode_long as resource_geocode_long, 
+                    pg.geocode_lat_from,
+                    pg.geocode_long_from, 
+                    pg.geocode_lat_at, 
+                    pg.geocode_long_at,
+                    CASE WHEN p.work_status = 'OFF SHIFT' THEN 1 ELSE 0 END as work_status,
+                    p.modified_dttm AS resource_modified_dttm                   
                FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
                JOIN dbo.c_task_routes_preview_task_vw pp on pp.task_id = t.task_id
+                LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
+                LEFT JOIN dbo.c_person_geocode_vw pg ON p.person_id = pg.person_id
                     LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
 						       WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
                  ORDER BY t.modified_dttm ASC 

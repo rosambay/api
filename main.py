@@ -20,7 +20,7 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from config import settings
 from loguru import logger
-from services import optimize_routes_vroom, get_route_distance_block
+from services import optimize_routes_vroom, get_route_distance_block, logs
 
 async def cleanSessionsRedis(r: Redis, session_web_id: str):
     # await r.delete(f"session:{session_web_id}")
@@ -434,7 +434,9 @@ async def getJobsResources(
 
 @app.get("/openjobs")
 async def getOpenJobs(
-    simulation_id: Optional[int] = None,
+    simulation_id: int,
+    team_id: int,
+    session: str,
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -444,14 +446,15 @@ async def getOpenJobs(
     clientId = current_user["clientId"]
     try:
       simulation_filter = ""
-      bind_params: dict = {"client_id": clientId, "user_id": userId}
+      bind_params: dict = {"client_id": clientId, "user_id": userId, "team_id": team_id}
       if simulation_id is not None:
+         
           simulation_filter = """
                 and not exists (
-                    select 1 from simulation_jobs sj
-                    where sj.client_id = j.client_id
-                      and sj.job_id = j.job_id
-                      and sj.simulation_id = :simulation_id
+                    select 1 from simulation_view sw
+                    where sw.client_id = j.client_id
+                      and sw.job_id = j.job_id
+                      and sw.simulation_id = :simulation_id
                 )"""
           bind_params["simulation_id"] = simulation_id
 
@@ -499,8 +502,9 @@ async def getOpenJobs(
               left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
               where ut.client_id = :client_id
                 and ut.user_id = :user_id
+                and j.team_id = :team_id
                 and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') and  js.internal_code_status is not null)
-                {simulation_filter}
+                 {simulation_filter}
             order by j.team_id, j.resource_id nulls last, j.actual_start_date, j.plan_start_date,  a.geocode_lat, a.geocode_long
         """).bindparams(**bind_params)
       result = await db.execute(smtp)
@@ -539,529 +543,491 @@ async def scheduleJobs(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(database.get_db),
 ):
-    resourceId = body.resource_id
+    resources = body.resources
     simulationId = body.simulation_id
-    p_date = body.p_date
     listJobs = body.jobs
     action = body.action
     userId = current_user["userId"]
     userName = current_user["userName"]
     clientId = current_user["clientId"]
 
-    smtp = text("""
-        SELECT 
-            job_id 
-          FROM jobs j
-            JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-         WHERE j.client_id = :client_id
-            AND j.team_id = :team_id
+    logger.info(f"Iniciado Calculo das rotas ...action - {action}, {len(resources)}, {len(listJobs)}")
+    
+    if action =='D' and len(listJobs) == 0 and len(resources) == 1:
+        smtp = text(f"""
+            UPDATE simulation
+                SET json_dado = (
+                    SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+                    FROM jsonb_array_elements(json_dado) AS elem
+                    WHERE (elem->>'resource_id')::INT NOT IN({','.join(str(j) for j in resources)})
+                )
+            WHERE client_id = :client_id
+                AND simulation_id = :simulation_id
+                RETURNING json_dado
+            """).bindparams(client_id=clientId, simulation_id = simulationId)
+        parametros = {
+            "client_id": clientId,
+            "simulation_id": simulationId
+        }
+        result = await db.execute(smtp, parametros)
+        await db.commit()
+        for row in result:
+            logger.warning(f'Reports finalizados!')
+            return row.json_dado
+       
+                
+    smtp = text(f"""
+        WITH dados AS (
+            SELECT j.client_id
+                ,t.team_id
+                ,300 time_overlap
+                ,j.job_id
+                ,j.address_id
+                ,a.geocode_lat::NUMERIC geocode_lat
+                ,a.geocode_long::NUMERIC geocode_long
+                ,COALESCE (j.time_setup, jt.time_setup, t.time_setup) AS time_setup
+                ,COALESCE (j.time_service, jt.time_service, t.time_service) AS time_service
+                ,j.priority + (COALESCE (jt.priority, 0) / 100)::INTEGER AS priority
+                ,EXTRACT (epoch FROM COALESCE (aw.start_time, CAST ('00:00:00' AS TIME)))::INTEGER AS start_time
+                --,0 AS start_time
+                ,EXTRACT (epoch FROM COALESCE (aw.end_time, CAST ('23:59:59' AS TIME)))::INTEGER AS end_time
+            FROM jobs  j
+                JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+                JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
+                JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+                JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
+                JOIN simulation s ON s.client_id = t.client_id and s.team_id = t.team_id
+                LEFT JOIN address_windows aw
+                ON     aw.client_id = j.client_id
+                    AND aw.address_id = j.address_id
+                    AND aw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
+        WHERE   j.client_id = :client_id
+            AND s.simulation_id = :simulation_id
+            AND j.job_id IN ({','.join(str(j) for j in listJobs)})
             AND a.geocode_lat is not null
             AND a.geocode_long is not null
             and (a.geocode_lat::NUMERIC) < 100
             AND (a.geocode_long::NUMERIC) < 100
-            limit 1
-               """)
-
-
-    logger.info(f"""Parâmetros: action - {action} resource_id - {resourceId}, simulation_id - {simulationId}, jobs - ({listJobs}),  p_date - {p_date}""")
-    jobExists = True
-    if action == 'I':
-      logger.info("Criando os jobs da simulação ...")
-      smtp = text(f"""
-        MERGE INTO simulation_jobs u
-            USING (SELECT client_id
-                          ,job_id
-                          ,client_job_id
-                          ,team_id
-                          ,job_status_id
-                          ,job_type_id
-                          ,address_id
-                          ,place_id
-                      FROM jobs
-                    WHERE client_id = :client_id
-                      AND job_id in ({','.join(str(j) for j in listJobs)})) t
-                ON (    u.client_id = t.client_id
-                    AND u.job_id = t.job_id
-                    AND u.simulation_id = :simulation_id)
-        WHEN NOT MATCHED
-        THEN
-          INSERT     (client_id
-                    ,simulation_id
-                    ,job_id
-                    ,client_job_id
-                    ,team_id
-                    ,resource_id
-                    ,job_status_id
-                    ,job_type_id
-                    ,address_id
-                    ,place_id
-                    ,created_by
-                    ,created_date
-                    ,modified_by
-                    ,modified_date)
-            VALUES (t.client_id
-                  , :simulation_id
-                  ,t.job_id
-                  ,t.client_job_id
-                  ,t.team_id
-                  , :resource_id
-                  ,t.job_status_id
-                  ,t.job_type_id
-                  ,t.address_id
-                  ,t.place_id
-                  , :user_name
-                  ,now ()
-                  , :user_name
-                  ,now ());
-      """).bindparams(client_id=clientId, user_name=userName, resource_id=resourceId, simulation_id = simulationId)
-      
-      result = await db.execute(smtp)
-    if action == 'D':
-       smtp = text(f"""
-        DELETE FROM simulation_jobs
-          WHERE client_id = :client_id
-            AND simulation_id = :simulation_id
-            AND job_id in ({','.join(str(j) for j in listJobs)})
-        """).bindparams(client_id=clientId, simulation_id = simulationId)
-       result = await db.execute(smtp)
-       await db.commit()
-       jobExists = await db.scalar(select(
-            exists().where(
-                models.SimulationJobs.client_id == clientId,
-                models.SimulationJobs.simulation_id  == simulationId,
-            )
-        ))
-       if not jobExists:
-          return []
-
-       
-    # await db.commit()
-    
-    
-    logger.info("Criando os resources da simulação ...")
-    smtp = text(f"""
-        MERGE INTO simulation_resources u
-            USING (SELECT client_id, resource_id
-                      FROM resources
-                    WHERE     client_id = :client_id
-                          AND resource_id = :resource_id) t
-                ON (    u.client_id = t.client_id
-                    AND u.resource_id = t.resource_id
-                    AND u.simulation_id = :simulation_id)
-        WHEN NOT MATCHED
-        THEN
-          INSERT     (client_id
-                    ,simulation_id
-                    ,resource_id
-                    ,created_by
-                    ,created_date
-                    ,modified_by
-                    ,modified_date)
-            VALUES (t.client_id
-                  , :simulation_id
-                  ,t.resource_id
-                  , :user_name
-                  ,now ()
-                  , :user_name
-                  ,now ());
-    """).bindparams(client_id=clientId, user_name=userName, resource_id=resourceId, simulation_id = simulationId)
-    result = await db.execute(smtp)
-    # await db.commit()
-    
-    logger.info("Iniciado Calculo das rotas ...")
-    smtp = text(f"""
-          WITH q1 AS (
-              SELECT j.client_id
-                    ,j.job_id
-                    ,r.resource_id
-                    ,r.time_overlap
-                    ,j.address_id
-                    ,a.geocode_lat::NUMERIC geocode_lat
-                    ,a.geocode_long::NUMERIC geocode_long
-                    ,COALESCE (j.time_setup, jt.time_setup, r.time_setup, t.time_setup) AS time_setup
-                    ,COALESCE (j.time_service, jt.time_service, r.time_service, t.time_service) AS time_service
-                    ,j.priority + (COALESCE (jt.priority, 0) / 100)::INTEGER AS priority
-                    --,EXTRACT (epoch FROM COALESCE (aw.start_time, rw.start_time))::INTEGER AS start_time
-                    ,0 AS start_time
-                    ,EXTRACT (epoch FROM COALESCE (aw.end_time, CAST ('23:59:59.9999' AS TIME)))::INTEGER AS end_time
-                FROM jobs  j
-                    JOIN simulation_jobs sj ON sj.client_id = j.client_id AND sj.job_id = j.job_id
-                    JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                    JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
-                    JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-                    JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
-                    JOIN resources r ON r.client_id = j.client_id AND r.resource_id = j.resource_id
-                    JOIN resource_windows rw
-                      ON     rw.client_id = r.client_id
-                          AND rw.resource_id = r.resource_id
-                          AND rw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
-                    LEFT JOIN address_windows aw
-                      ON     aw.client_id = j.client_id
-                          AND aw.address_id = j.address_id
-                          AND aw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
-              WHERE     sj.client_id = :client_id
-                    AND sj.simulation_id = :simulation_id
-                    AND r.resource_id = :resource_id
-          ),
-          MapeamentoEnderecos AS (
-              SELECT 
-                  q1.*,
-                  COUNT(job_id) OVER (
-                      PARTITION BY client_id, geocode_lat, geocode_long
-                  ) AS quantidade_jobs_mesmo_endereco,
-                  ROW_NUMBER() OVER (
-                      PARTITION BY client_id, geocode_lat, geocode_long
-                      ORDER BY job_id ASC
-                  ) AS ordem_job
-              FROM q1),
-            jobs_data AS (
-            SELECT 
-                client_id,
-                job_id,
-                resource_id,
-                address_id,
-                geocode_lat,
-                geocode_long,
-                time_setup,
-                time_service + (time_overlap * (quantidade_jobs_mesmo_endereco -1)) as time_service,
-                priority,
-                start_time,
-                end_time
-            FROM MapeamentoEnderecos
-            WHERE ordem_job = 1),
-              vehicles_data AS (
-                select 
-                  r.resource_id,
-                  r.description,
-                  r.geocode_lat_from::NUMERIC,
-                  r.geocode_long_from::NUMERIC,
-                  r.geocode_lat_at::NUMERIC,
-                  r.geocode_long_at::NUMERIC, 
-                  EXTRACT(EPOCH FROM
-                  CASE 
-                    WHEN CAST(:p_date as date) <= NOW() THEN
-                      CASE 
-                          WHEN COALESCE(rw.start_time, cast('00:00:00.9999' as time)) < NOW()::TIME 
-                          THEN 
-                              NOW()::TIME
-                          ELSE
-                          COALESCE(rw.start_time, cast('00:00:00' as time))
-                      END
-                    ELSE
-                      COALESCE(rw.start_time, cast('00:00:00' as time))
-                  END) ::INTEGER AS start_time,
-                  EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end) ::INTEGER AS end_time
-                from resources r
-                  join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM CAST('{p_date}' AS DATE)) + 1
-                  where r.client_id = :client_id
-                    and r.resource_id = :resource_id
-              ),
-              vehicles_json AS (
-                  SELECT json_agg(
-                  json_strip_nulls(
-                      json_build_object(
-                          'id', resource_id,
-                          'description', description,
-                          'start', json_build_array(geocode_long_from, geocode_lat_from),
-                          'end', json_build_array(geocode_long_at, geocode_lat_at),
-                          'time_window', json_build_array(start_time, end_time)
-                      ))
-                  ) AS array_vehicles
-                  FROM vehicles_data
-              ),
-              jobs_json AS (
-                  -- Agrupa todos os jobs em um array JSON
-                  SELECT json_agg(
-                  json_strip_nulls(
-                      json_build_object(
-                          'id', job_id,
-                          'location', json_build_array(geocode_long, geocode_lat),
-                          'setup', time_setup,
-                          'service', time_service,
-                          'priority', priority,
-                          'time_windows', json_build_array(json_build_array(start_time, end_time)) 
-                      ))
-                  ) AS array_jobs
-                  FROM jobs_data
-              )
-              SELECT json_build_object(
-                  'vehicles', (SELECT array_vehicles FROM vehicles_json),
-                  'jobs', (SELECT array_jobs FROM jobs_json)
-              ) AS vroom_payload;
-    """).bindparams(client_id=clientId, simulation_id=simulationId, p_date = p_date, resource_id = resourceId)
-
-    result = await db.execute(smtp)
-    rows = result.mappings().all()
-    if rows and len(rows) > 0:
-      vroom_payload = rows[0]['vroom_payload']
-      logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
-      print(vroom_payload)
-      retorno = await optimize_routes_vroom(vroom_payload)
-      listIds = [item['id'] for item in retorno.get("unassigned", [])]
-      if listIds:
-        smtp = text(f"""
-          DELETE FROM simulation_jobs
-            WHERE client_id = :client_id
-              AND simulation_id = :simulation_id
-              AND job_id in ({','.join(str(j) for j in listIds)})
-          """).bindparams(client_id=clientId, simulation_id = simulationId)
-        result = await db.execute(smtp)
-        await db.commit()
-        jobExists = await db.scalar(select(
-              exists().where(
-                  models.SimulationJobs.client_id == clientId,
-                  models.SimulationJobs.simulation_id  == simulationId,
-              )
-          ))
-        if not jobExists:
-            return []
-
-    steps = retorno['routes'][0]['steps']
-    # somente_jobs = [step for step in steps if step.get('type') == 'job']
-    somente_jobs = [step for step in steps]
-    jsonJobs = json.dumps(somente_jobs)
-    # print(jsonJobs)
-    smtp = text(f""" 
-          with qjson as (
-          SELECT 
-              id AS job_id,
-              type,
-              (location->>0)::NUMERIC AS geocode_long,
-              (location->>1)::NUMERIC AS geocode_lat,
-              arrival,
-              duration,
-              setup,
-              service,
-              waiting_time
-          FROM 
-              jsonb_to_recordset('{jsonJobs}') AS x(
-                  id int,
-                  type text,
-                  location jsonb,
-                  arrival int,
-                  duration int,
-                  setup int,
-                  service int,
-                  waiting_time int
-              )),
-          q1 AS (
-              SELECT * FROM qjson
-                WHERE type = 'job'),
-          q2 as (
-            select arrival from qjson
-              where type = 'start'),
-          q3 as (
-            select arrival from qjson
-              where type = 'end')
-          SELECT   j.client_id,
-                  j.job_id,
-                  r.time_overlap,
-                  a.geocode_lat::NUMERIC AS geocode_lat,
-                  a.geocode_long::NUMERIC AS geocode_long,
-                  r.geocode_lat_from,
-                  r.geocode_long_from,
-                  r.geocode_lat_at,
-                  r.geocode_long_at,
-                  COALESCE(j.time_service,jt.time_service,t.time_service) AS time_service,
-                  q1.arrival,
-                  q2.arrival AS arrival_start,
-                  q3.arrival AS arrival_end,
-                  q1.duration,
-                  q1.setup,
-                  q1.service,
-                  q1.waiting_time
-              FROM jobs j
-                  JOIN simulation_jobs sj ON sj.client_id = j.client_id AND sj.job_id = j.job_id
-                  JOIN job_types jt ON jt.client_id = j.client_id AND jt.job_type_id = j.job_type_id
-                  JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                  JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
-                  JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-                  JOIN resources r ON r.client_id = j.client_id AND r.resource_id = j.resource_id
-                  JOIN q1 on q1.geocode_lat = a.geocode_lat::NUMERIC and q1.geocode_long = a.geocode_long::NUMERIC
-                  CROSS JOIN q2
-                  CROSS JOIN q3
-              WHERE sj.client_id = :client_id
-                  AND sj.simulation_id = :simulation_id
-                  and r.resource_id = :resource_id
-                order by q1.arrival, j.plan_start_date
-        """).bindparams(client_id=clientId, simulation_id=simulationId, resource_id = resourceId)
-    result = await db.execute(smtp)
-    rows = result.mappings().all()
-    rId = None
-    geocode_long_at = None
-    geocode_lat_at = None
-    geo = []
-    arrivalStart = None
-    arrivalEnd = None
-    for row in rows:
-      if rId is None:
-        geo.append([row.geocode_long_from,row.geocode_lat_from])
-        geocode_long_at = row.geocode_long_at
-        geocode_lat_at = row.geocode_lat_at
-        arrivalStart = row.arrival_start
-        arrivalEnd = row.arrival_end
-        rId = 1
-      geo.append([row.geocode_long,row.geocode_lat])
-    geo.append([geocode_long_at,geocode_lat_at])
-    geoResult = await get_route_distance_block(geo)
-    simulatedWindowEndDate = None
-    simulatedWindowDistanceEnd = 0
-    simulatedWindowTimeDistanceEnd = 0
-    vArrivalBefore = None
-    totalOverlap = 0
-    rOrder = 1
-    distance = 0
-    timeDistance = 0
-    for row in rows:
-      jobId = row.job_id
-      vArrival = row.arrival
-      vSetup = row.setup
-      vService = row.time_service
-      logger.info(f"Otimizando recurso {resourceId} - Job {jobId} , arrival: {vArrival} - arrival before: {vArrivalBefore} - Overlap - {row.time_overlap} total overlap {totalOverlap}")
-      if vArrivalBefore == vArrival:
-        totalOverlap += row.time_overlap
-        vArrival = vArrival + totalOverlap
-      else:
-        vArrivalBefore = vArrival
-        totalOverlap = 0
-
-      vDtStart = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=vArrival)
-      vDtEnd = datetime.strptime(p_date, '%Y-%m-%d') + timedelta(seconds=vArrival + vSetup + vService)
-
-      distance = round(geoResult[(rOrder - 1)]["distance"])
-      timeDistance = round(geoResult[(rOrder - 1)]["duration"]) 
-
-      await db.execute(
-          update(models.SimulationJobs)
-          .where(
-              models.SimulationJobs.client_id == clientId,
-              models.SimulationJobs.simulation_id == simulationId,
-              models.SimulationJobs.job_id == jobId,
-          )
-          .values(
-              simulated_window_start_date=vDtStart,
-              simulated_window_end_date=vDtEnd,
-              simulated_window_distance=distance,
-              simulated_window_time_distance=timeDistance,
-              simulated_window_time_setup=vSetup,
-              simulated_window_order = rOrder,
-              modified_by=userName,
-              modified_date=datetime.now(),
-          )
-      )
-      # await db.commit()
-      rOrder += 1
-      simulatedWindowEndDate = vDtEnd
-        
-
-      logger.info(f'Calculando distância Simulada Window Final ...')
-
-      simulatedWindowDistanceEnd = round(geoResult[(rOrder-1)]["distance"])
-      simulatedWindowTimeDistanceEnd = round(geoResult[(rOrder-1)]["duration"])
-      simulatedWindowDistanceStart = round(geoResult[(0)]["distance"])
-      simulatedWindowTimeDistanceStart = round(geoResult[(0)]["duration"])
-     
-      todayZero = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-      simulatedWindowEndDate = todayZero + timedelta(seconds=arrivalEnd)
-      simulatedWindowStartDate = todayZero + timedelta(seconds=arrivalStart)
-
-      await db.execute(
-          update(models.SimulationResources)
-          .where(
-              models.SimulationResources.client_id == clientId,
-              models.SimulationResources.simulation_id == simulationId,
-              models.SimulationResources.resource_id == resourceId
-          )
-          .values(
-              simulated_window_distance_start = simulatedWindowDistanceStart,
-              simulated_window_start_date = simulatedWindowStartDate,
-              simulated_window_time_distance_start = simulatedWindowTimeDistanceStart,
-              simulated_window_distance_end = simulatedWindowDistanceEnd,
-              simulated_window_end_date = simulatedWindowEndDate,
-              simulated_window_time_distance_end = simulatedWindowTimeDistanceEnd,
-              modified_by=userName,
-              modified_date=datetime.now(),
-          )
-      )
-      await db.commit()   
-
-    smtp = text(f"""
-        with q1 as(
-            select 
-              'SIMULATED' as type,
-              j.job_id,
-              j.client_job_id,
-              j.team_id, 
-              j.resource_id, 
-              r.client_resource_id,
-              sr.simulated_window_distance_end as resource_simulated_window_distance_end,
-              sr.simulated_window_end_date as resource_simulated_window_end_date,
-              sr.simulated_window_time_distance_end as resource_simulated_window_time_distance_end,
-              sr.simulated_window_distance_start as resource_simulated_window_distance_start,
-              sr.simulated_window_start_date as resource_simulated_window_start_date,
-              sr.simulated_window_time_distance_start as resource_simulated_window_time_distance_start,
-              j.simulated_window_order,
-              j.job_status_id, 
-              js.description AS status_description,
-              js.internal_code_status,
-              js.style_id,
-              j.job_type_id, 
-              jt.description as type_description,
-              j.address_id, 
-              a.client_address_id, 
-              a.geocode_lat, 
-              a.geocode_long, 
-              a.address, 
-              a.city, 
-              a.state_prov, 
-              a.zippost, 
-              p.trade_name, 
-              p.cnpj,
-              j.simulated_window_time_setup,
-              j.simulated_window_start_date,
-              j.simulated_window_end_date,
-              j.simulated_window_distance,
-              j.simulated_window_time_distance
-              from simulation_jobs j
-              JOIN simulation_resources sr on sr.client_id = j.client_id and sr.simulation_id = j.simulation_id and sr.resource_id = j.resource_id
-              join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              where j.client_id = :client_id
-                and j.simulation_id = :simulation_id
-                and j.resource_id = :resource_id )
-        select
-            q1.team_id,
-            q1.resource_id,
-            q1.resource_simulated_window_distance_end,
-            q1.resource_simulated_window_end_date,
-            q1.resource_simulated_window_time_distance_end,
-            q1.resource_simulated_window_distance_start,
-            q1.resource_simulated_window_start_date,
-            q1.resource_simulated_window_time_distance_start,
-            jsonb_agg(to_jsonb(q1) ORDER BY q1.simulated_window_order) AS resources
-          from q1
-          group by q1.team_id,
-            q1.resource_id,
-            q1.resource_simulated_window_distance_end,
-            q1.resource_simulated_window_end_date,
-            q1.resource_simulated_window_time_distance_end,
-            q1.resource_simulated_window_distance_start,
-            q1.resource_simulated_window_start_date,
-            q1.resource_simulated_window_time_distance_start
             
-      """).bindparams(client_id=clientId, simulation_id = simulationId, resource_id = resourceId)
-    logger.info('Iniciou terceira consulta...')             
+        ),
+        MapeamentoEnderecos AS (
+            SELECT 
+                *,
+                -- 1. Conta o total de jobs para o mesmo address_id (e client_id, por segurança)
+                COUNT(job_id) OVER (
+                    PARTITION BY client_id, team_id, geocode_lat, geocode_long
+                ) AS quantidade_jobs_mesmo_endereco,
+                
+                -- 2. Cria um ranking ordenando pelo menor job_id
+                ROW_NUMBER() OVER (
+                    PARTITION BY client_id, team_id, geocode_lat, geocode_long
+                    ORDER BY job_id ASC
+                ) AS ordem_job
+            FROM dados
+        ),
+        list as (
+            SELECT json_agg(job_id) AS job_id_list
+                FROM dados
+        ),
+        q1 as (
+            SELECT 
+            client_id,
+            team_id,
+            job_id,
+            address_id,
+            geocode_lat,
+            geocode_long,
+            time_setup,
+            time_service + (time_overlap * (quantidade_jobs_mesmo_endereco -1)) as time_service,
+            priority,
+            start_time,
+            end_time
+            FROM MapeamentoEnderecos
+            WHERE ordem_job = 1
+        ),
+        vehicles_data AS (
+            select
+            r.resource_id,
+            r.description,
+            r.geocode_lat_from::NUMERIC,
+            r.geocode_long_from::NUMERIC,
+            r.geocode_lat_at::NUMERIC,
+            r.geocode_long_at::NUMERIC,
+            EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
+            EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
+            from resources r
+            join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
+            join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
+            join simulation s ON s.client_id = t.client_id and s.team_id = t.team_id
+            LEFT JOIN resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM s.simulation_date) + 1
+            where r.client_id = :client_id
+             and s.simulation_id = :simulation_id
+            and r.resource_id IN ({','.join(str(j) for j in resources)})
+        ),
+        vehicles_json AS (
+        SELECT json_agg(
+        json_strip_nulls(
+            json_build_object(
+                'id', resource_id,
+                'description', description,
+                'start', json_build_array(geocode_long_from, geocode_lat_from),
+                'end', json_build_array(geocode_long_at, geocode_lat_at),
+                'time_window', json_build_array(start_time, end_time)
+            ))
+        ) AS array_vehicles
+        FROM vehicles_data
+        ),
+        jobs_json AS (
+            -- Agrupa todos os jobs em um array JSON
+            SELECT json_agg(
+            json_strip_nulls(
+                json_build_object(
+                    'id', job_id,
+                    'location', json_build_array(geocode_long, geocode_lat),
+                    'setup', time_setup,
+                    'service', time_service,
+                    'priority', priority,
+                    'time_windows', json_build_array(json_build_array(start_time, end_time)) 
+                ))
+            ) AS array_jobs
+            FROM q1
+        )
+        SELECT json_build_object(
+            'vehicles', (SELECT array_vehicles FROM vehicles_json),
+            'jobs', (SELECT array_jobs FROM jobs_json),
+            'list', (SELECT job_id_list FROM list)
+        ) AS vroom_payload;
+    """).bindparams(client_id=clientId, simulation_id = simulationId)
     result = await db.execute(smtp)
-    rows = result.mappings().all()
+    subRows = result.mappings().all()
+    if not subRows or len(subRows) == 0:
+        return
+    await logs(clientId=clientId,log='dados para vroom',logJson=dict(subRows[0]))
+    vroom_payload = subRows[0]['vroom_payload']
 
-    res = [dict(row) for row in rows]
-    logger.info('Finalizou terceira consulta...')             
-    return res       
+    listJobs = vroom_payload.pop('list', 'Chave não encontrada')
+    logger.info(list(listJobs))
+    logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
+    retorno = await optimize_routes_vroom(vroom_payload)
+                    
+    routes = retorno['routes']
+    for rou in routes:
+        # print(rou)
+        # print('--------------------------------------')
+        steps = rou['steps']
+        geo = []
+        for step in steps:
+            geo.append([step['location'][0],step['location'][1]])
+        # print(geo)
+        # print('---------------------------------------')
+        await logs(clientId=clientId,log='montagem do geo',logJson=geo)
+        geoResult = await get_route_distance_block(geo)
+        await logs(clientId=clientId,log='retorno do geo',logJson=geoResult)
+        # print(geoResult) if r=='BRAC' else None
+        ln = 1
+        step = rou['steps'][0]
+        step['time_distance'] = 0
+        step['distance'] = 0
+        for x in geoResult:
+            # print(x['duration'],x['distance'])
+            step = rou['steps'][ln]
+            step['time_distance'] = x['duration']
+            step['distance'] = x['distance']
+            # print(ln,' - ',step)
+            ln += 1
+    listIds = [item['id'] for item in retorno.get("unassigned", [])]
+    if listIds:
+        await logs(clientId=clientId,log='lista de unassigned',logJson=listIds)
+        logger.debug(f'Lista de jobs excluidas da rota... {listIds}')
+    
+    await logs(clientId=clientId,log='retorno do vroom',logJson=retorno)
+    
+    vroomResult = json.dumps(retorno)
+    smtp = text(f"""
+        WITH payload_data AS (
+            SELECT '{vroomResult}'::jsonb AS data
+        ),
+        rotas AS (
+            SELECT 
+                (rota_json->>'vehicle')::int AS id_veiculo,
+                rota_json->>'description' AS nome_motorista,
+                rota_json->'steps' AS passos_array
+            FROM payload_data,
+                jsonb_array_elements(data->'routes') AS rota_json
+        ),
+        q1 as (
+            SELECT
+                r.id_veiculo::int AS resource_id,
+                ordem_passo::int AS sequence,
+                passo_json->>'type' AS stop_type,
+                (passo_json->>'id')::int AS job_id,
+                (passo_json->'location'->>0)::numeric AS geocode_long,
+                (passo_json->'location'->>1)::numeric AS geocode_lat,
+                (passo_json->>'arrival')::int as arrival,
+                (passo_json->>'service')::int AS service,
+                (passo_json->>'setup')::int AS setup,
+                (passo_json->>'distance')::numeric::int AS distance,
+                (passo_json->>'time_distance')::numeric::int AS time_distance
+            FROM rotas r,
+                jsonb_array_elements(r.passos_array) WITH ORDINALITY AS passo(passo_json, ordem_passo)
+        ),
+        dados_jobs as(
+            select  j.client_id,
+                    j.team_id,
+                    j.job_id,
+                    s.simulation_date AS job_day,
+                    300 time_overlap,
+                    j.client_job_id,
+                    js.description AS status_description,
+                    jt.description as type_description,
+                    CASE WHEN j.job_id <>  FIRST_VALUE(job_id) OVER (PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long ORDER BY job_id ASC)
+                    THEN FIRST_VALUE(job_id) OVER (PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long ORDER BY job_id ASC)
+                    ELSE j.job_id
+                    END AS new_job_id,
+                    j.job_type_id,
+                    j.job_status_id,
+                    COALESCE (j.time_service, jt.time_service, t.time_service) AS time_service,
+                    ROW_NUMBER() OVER (
+                    PARTITION BY j.client_id, j.team_id, a.geocode_lat, a.geocode_long
+                    ORDER BY job_id ASC
+                ) AS ordem_job,
+                    j.place_id,
+                    j.address_id,
+                    a.geocode_lat, 
+                    a.geocode_long,
+                    a.address, 
+                    a.city, 
+                    a.state_prov, 
+                    a.zippost,
+                    p.trade_name, 
+                    p.cnpj
+            from jobs j
+            join address a on a.client_id = j.client_id and a.address_id = j.address_id
+            join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
+            join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+            JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
+            join places p on p.client_id = j.client_id and p.place_id = j.place_id
+            JOIN simulation s ON s.client_id = t.client_id and s.team_id = t.team_id
+            where j.client_id = :client_id
+                and s.simulation_id = :simulation_id
+                and j.job_id IN ({','.join(str(j) for j in listJobs)})
+        ),
+        dados as(
+            select 
+                r.client_id,
+                r.resource_id,
+                r.client_resource_id,
+                j.team_id,
+                j.client_job_id,
+                r.description resource_name,
+                j.status_description,
+                j.type_description,
+                j.address, 
+                j.city, 
+                j.state_prov, 
+                j.zippost, 
+                j.trade_name, 
+                j.cnpj,
+                j.job_day,
+                q_1.geocode_long AS geocode_long_from,
+                q_1.geocode_lat AS  geocode_lat_from,
+                q_1.arrival AS arrival_from,
+                q_3.distance AS distance_from,
+                q_3.time_distance as time_distance_from,
+                
+                q_2.geocode_long AS geocode_long_at,
+                q_2.geocode_lat AS  geocode_lat_at,
+                q_2.arrival AS arrival_at,
+                q_2.distance AS distance_at,
+                q_2.time_distance as time_distance_at,
+                
+                j.job_id,
+                q.geocode_long,
+                q.geocode_lat,
+                q.setup,
+                --q.arrival,
+                j.ordem_job,
+                CASE 
+                    WHEN j.ordem_job > 1
+                    THEN
+                        q.arrival + (j.time_overlap * (j.ordem_job-1))
+                    ELSE
+                    q.arrival
+                end AS arrival,
+                j.time_service AS service,      
+                --q.service,
+                CASE 
+                    WHEN j.ordem_job > 1
+                    THEN
+                        0
+                    ELSE
+                    q.distance
+                end AS distance,
+                --q.distance,
+                CASE 
+                    WHEN j.ordem_job > 1
+                    THEN
+                        0
+                    ELSE
+                    q.time_distance
+                end AS time_distance
+                --q.time_distance
+            from q1 q
+            join dados_jobs j ON j.client_id = 1 and j.new_job_id = q.job_id
+            join resources r ON r.client_id = 1 and r.resource_id = q.resource_id
+            join q1 q_1 on q_1.resource_id = q.resource_id and q_1.stop_type = 'start'
+            join q1 q_2 on q_2.resource_id = q.resource_id and q_2.stop_type = 'end'
+            join q1 q_3 on q_3.resource_id = q.resource_id and q_3.stop_type = 'job' AND q_3.sequence = 2
+        ),
+        dados_new as (
+            select 
+            a.*,
+            a.job_day + (arrival *  INTERVAL '1 second') start_date,
+            a.job_day + ((arrival + setup + service) *  INTERVAL '1 second') end_date,
+            a.job_day + ((arrival_from) *  INTERVAL '1 second') date_from,
+            a.job_day + ((arrival_at) *  INTERVAL '1 second') date_at
+            from dados a
+        ),
+        grp as (
+            select 
+                q.client_id,
+                q.resource_id,
+                q.client_resource_id,
+                q.resource_name,
+                q.job_day,
+                q.geocode_long_from,
+                q.geocode_lat_from,
+                q.distance_from,
+                q.time_distance_from,
+                q.arrival_from,
+                q.date_from,
+                q.geocode_long_at,
+                q.geocode_lat_at,
+                q.distance_at,
+                q.time_distance_at,
+                q.arrival_at,
+                q.date_at,
+                json_agg(
+                    json_build_object(
+                        'client_id', q.client_id,
+                        'job_id', q.job_id,
+                        'team_id', q.team_id,
+                        'client_job_id', q.client_job_id,
+                        'status_description', q.status_description,
+                        'type_description', q.type_description,
+                        'address', q.address, 
+                        'city', q.city, 
+                        'state_prov', q.state_prov, 
+                        'zippost', q.zippost, 
+                        'trade_name', q.trade_name, 
+                        'cnpj', q.cnpj,
+                        'job_day', q.job_day,      
+                        'geocode_lang', q.geocode_long,
+                        'geocode_lat', q.geocode_lat,
+                        'arrival', q.arrival,
+                        'service', q.service,
+                        'distance', q.distance,
+                        'time_distance', q.time_distance,
+                        'start_date', q.start_date,
+                        'end_date', q.end_date
+                    ) ORDER BY q.start_date
+                ) AS jobs,
+                sum(q.distance) + max(q.distance_at) as total_distance,
+                sum(q.time_distance) + max(q.time_distance_at) as total_time_distance,
+                count(q.job_id) total_jobs
+            from dados_new q
+            GROUP BY  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
+        )
+        select
+            json_agg(
+                json_build_object(
+                    'client_id', client_id,
+                    'resource_id', resource_id,
+                    'client_resource_id', client_resource_id,
+                    'resource_name', resource_name,
+                    'job_day', job_day,
+                    'geocode_long_from', geocode_long_from,
+                    'geocode_lat_from', geocode_lat_from,
+                    'distance_from', distance_from,
+                    'time_distance_from', time_distance_from,
+                    'arrival_from', arrival_from,
+                    'date_from', date_from,
+                    'geocode_long_at', geocode_long_at,
+                    'geocode_lat_at', geocode_lat_at,
+                    'distance_at', distance_at,
+                    'time_distance_at', time_distance_at,
+                    'arrival_at', arrival_at,
+                    'date_at', date_at,
+                    'total_distance', total_distance,
+                    'total_time_distance', total_time_distance,
+                    'total_jobs', total_jobs,
+                    'jobs', jobs
+                )
+            ) AS res
+        from grp
+    """).bindparams(client_id=clientId,simulation_id = simulationId)
+    result = await db.execute(smtp)
+    subSubRows = result.mappings().all()
+    if not subSubRows or len(subSubRows) == 0:
+        return
+    
+    await logs(clientId=clientId,log=f'Resultado da Simulacao',logJson=subSubRows[0])
+    res = subSubRows[0]['res']
 
+    rep_json = json.dumps(res)
+    if len(resources) == 1:
+        smtp = text(f"""
+            UPDATE simulation
+            SET json_dado = 
+                -- 1. Monta um array com todos os itens, EXCETO o ID 3 (remove o antigo se existir)
+                COALESCE(
+                    (
+                        SELECT jsonb_agg(elem)
+                        FROM jsonb_array_elements(json_dado) AS elem
+                        WHERE (elem->>'resource_id')::INT NOT IN ({','.join(str(j) for j in resources)})
+                    ), 
+                    '[]'::jsonb -- Garante que não retorne NULL caso o array fique vazio
+                ) 
+                
+                || -- Operador de concatenação de JSONB
+                
+                -- 2. Adiciona o NOVO nó inteiro (dentro de colchetes para mesclar no array principal)
+                :json_data
+                ,modified_by = 'system'
+                ,modified_date  = NOW()
+
+            WHERE  client_id = :client_id and simulation_id = :simulation_id
+            RETURNING
+                json_dado
+                   """)
+        
+    else:   
+        smtp = text(f"""
+            MERGE INTO simulation u
+            USING (SELECT CAST(:json_data AS jsonb) as rep) as t
+            ON ( client_id = :client_id and simulation_id = :simulation_id)
+            WHEN MATCHED THEN
+            UPDATE SET 
+                json_dado = t.rep
+                ,modified_by = 'system'
+                ,modified_date  = NOW()
+            RETURNING
+                json_dado
+        """)
+    
+    parametros = {
+        "client_id": clientId,
+        "simulation_id": simulationId,
+        "json_data": rep_json
+    }
+    result = await db.execute(smtp, parametros)
+    await db.commit()
+    for row in result:
+       return row.json_dado
+    logger.warning(f'Reports finalizados!')
+
+    return res
+    
 @app.post("/allschedulejobs")
 async def allScheduleJobs(
     body: schemas.AllScheduleJobsRequest,
@@ -1605,9 +1571,9 @@ async def allScheduleJobs(
     logger.info('Finalizou terceira consulta...')             
     return res       
 
-@app.post("/newroutes")
-async def createNewRoutes(
-    body: schemas.NewRoutesRequest,
+@app.post("/newsimulation")
+async def createNewSimulation(
+    body: schemas.NewSimulationRequest,
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -1620,9 +1586,11 @@ async def createNewRoutes(
     userName = current_user["userName"]
     clientId = current_user["clientId"]
 
-    p_date      = body.p_date
-    resource_id = body.resource_id
+    p_date    = body.p_date
+    teamId   = body.team_id
+    session   = body.session
 
+    print("session",session)
     try:
         date.fromisoformat(p_date)
     except ValueError:
@@ -1635,6 +1603,7 @@ async def createNewRoutes(
             .where(
                 models.Simulation.client_id == clientId,
                 models.Simulation.user_id   == userId,
+                models.Simulation.session   == session,
             )
             .order_by(models.Simulation.sequence.desc())
         )
@@ -1646,9 +1615,10 @@ async def createNewRoutes(
         newSimulation = models.Simulation(
             client_id       = clientId,
             user_id         = userId,
+            team_id         = teamId,
             simulation_date = date.fromisoformat(p_date),
+            session         = session,
             sequence        = nextSequence,
-            fl_calc_arround = 1,
             created_by      = userName,
             created_date    = now,
             modified_by     = userName,
@@ -1657,24 +1627,24 @@ async def createNewRoutes(
         db.add(newSimulation)
         await db.commit()
         await db.refresh(newSimulation)
-
+        
         logger.info(
-            "[newroutes] Simulação criada | client={} user={} sim_id={} seq={} date={} resource={}",
-            clientId, userId, newSimulation.simulation_id, nextSequence, p_date, resource_id,
+            "[newroutes] Simulação criada | client={} user={} team_id={} sim_id={} seq={} date={} session={}",
+            clientId, userId, teamId, newSimulation.simulation_id, nextSequence, p_date, session,
         )
-
         return {
             "simulation_id":   newSimulation.simulation_id,
             "uid":             str(newSimulation.uid),
+            "team_id":       newSimulation.team_id,
             "client_id":       newSimulation.client_id,
             "user_id":         newSimulation.user_id,
             "simulation_date": str(newSimulation.simulation_date),
             "sequence":        newSimulation.sequence,
-            "fl_calc_arround": newSimulation.fl_calc_arround,
-            "resource_id":     resource_id,
+            "session": newSimulation.session,
             "created_date":    newSimulation.created_date.isoformat(),
-        }
+        }    
 
+        
     except HTTPException:
         raise
     except Exception as e:

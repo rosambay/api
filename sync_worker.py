@@ -193,12 +193,12 @@ async def buildReports():
                             r.geocode_long_from::NUMERIC,
                             r.geocode_lat_at::NUMERIC,
                             r.geocode_long_at::NUMERIC,
-                            EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.start_time,t.start_time) else cast('00:00:00' as time) end ) ::INTEGER AS start_time,
+                            EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
                             EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
                             from resources r
                             join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
                             join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
-                            join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM :p_date) + 1
+                            LEFT JOIN resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM :p_date) + 1
                             where r.client_id = :client_id
                             and t.team_id = :team_id
                             {vBrac if r =='BRAC' else ''}
@@ -285,7 +285,7 @@ async def buildReports():
                     
                     await logs(clientId=clientId,log='retorno do vroom',logJson=retorno)
                     
-                    # if actualDate.strftime('%Y-%m-%d') == '2026-04-10':
+                    # if actualDate.strftime('%Y-%m-%d') == '2026-03-04':
                     #     return
                     # continue
 
@@ -1034,14 +1034,14 @@ async def getResources(r):
                               OR u.geocode_lat_from IS DISTINCT FROM t.geocode_lat_from
                               OR u.geocode_long_from IS DISTINCT FROM t.geocode_long_from
                               OR u.geocode_lat_at IS DISTINCT FROM t.geocode_lat_at
-                              OR u.fl_off_shift IS DISTINCT FROM t.work_status
+                              --OR u.fl_off_shift IS DISTINCT FROM t.work_status
                               OR u.geocode_long_at IS DISTINCT FROM t.geocode_long_at
                               OR u.description IS DISTINCT FROM t.name
                               )  THEN
                       UPDATE SET actual_geocode_lat = t.geocode_lat
                           ,actual_geocode_long = t.geocode_long
                           ,description = t.name
-                          ,fl_off_shift = t.work_status
+                          --,fl_off_shift = t.work_status --Voltar quando decidir se vai ser pelo cliente
                           ,modified_by = 'INTEGRATION'
                           ,modified_date = t.modified_dttm
                   WHEN NOT MATCHED THEN
@@ -1599,6 +1599,40 @@ async def getJobs(r):
       first_snap = result_rows[0]['first_snap'][:19].replace('T', ' ')
       try:
           jsonResults = json.dumps(result_rows)
+          #Criação do Resource  
+          stmt = text(f"""
+                  MERGE INTO resources AS u
+                  USING (
+                      SELECT 
+                        DISTINCT x.* 
+                      FROM jsonb_to_recordset(:dados_json)
+                        AS x( person_id text,
+                                resource_name text,
+                                resource_geocode_lat text,
+                                resource_geocode_long text,
+                                geocode_lat_from text,
+                                geocode_long_from text,
+                                geocode_lat_at text,
+                                geocode_long_at text,
+                                work_status integer,
+                                resource_modified_dttm TIMESTAMP
+                            )
+                        WHERE person_id IS NOT NULL
+                      ) AS t
+                  ON u.client_id = :client_id AND u.client_resource_id = t.person_id
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id,client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
+                      VALUES (:client_id, t.person_id, t.resource_name, t.work_status, t.resource_geocode_lat, t.resource_geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.resource_modified_dttm)
+                  RETURNING
+                       u.resource_id, merge_action(), to_jsonb(u) AS registro_json
+                  """)
+          async with SessionLocal() as db:
+                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
+                await db.commit()
+                for row in result:
+                  setSnap = True
+                  logger.info(f"ID: {row.resource_id} | Ação RESOURCE realizada: {row.merge_action}")
+
           # Criação do Team
           setSnap = False
           stmt = text(f"""
@@ -2051,7 +2085,7 @@ async def main():
 
     try:
         await asyncio.gather(
-            #processo_em_background(r),
+            # processo_em_background(r),
             processo_em_background_longo(r)
             # adicione outros workers aqui, ex: outro_processo(r),
         )

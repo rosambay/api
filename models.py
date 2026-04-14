@@ -439,9 +439,12 @@ class Simulation(Base):
     uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
     client_id = Column(Integer, primary_key=True, nullable=False)
     simulation_id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, nullable=False)
     user_id = Column(Integer, nullable=False)
     simulation_date = Column(Date, nullable=False)
+    session = Column(UUID(as_uuid=True), nullable=False)
     sequence = Column(Integer, nullable=False)
+    json_dado = Column(JSONB, nullable=True)
     fl_calc_board = Column(Integer, nullable=False, server_default=text("0"))
     fl_calc_plan = Column(Integer, nullable=False, server_default=text("0"))
     fl_calc_history = Column(Integer, nullable=False, server_default=text("0"))
@@ -456,115 +459,13 @@ class Simulation(Base):
                 ['users.client_id', 'users.user_id'],
                 name='fk_simulation_users'
             ),
-            UniqueConstraint('client_id','user_id', 'simulation_date', 'sequence', name='uk_simulation'),
-        )    
-
-class SimulationJobs(Base):
-    __tablename__ = "simulation_jobs"
-
-    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
-    client_id = Column(Integer, primary_key=True, nullable=False)
-    simulation_id = Column(Integer, primary_key=True, nullable=False)
-    job_id = Column(Integer, primary_key=True, nullable=False)
-    client_job_id = Column(String(128), nullable=False)
-    team_id  = Column(Integer, nullable=False)
-    resource_id  = Column(Integer, nullable=True)
-    job_status_id  = Column(Integer, nullable=False)
-    job_type_id  = Column(Integer, nullable=False)
-    address_id = Column(Integer, nullable=False)
-    place_id  = Column(Integer, nullable=False)
-    time_setup = Column(Integer, nullable=True)
-    time_service = Column(Integer, nullable=True)
-    start_date = Column(DateTime, nullable=True)
-    end_date = Column(DateTime, nullable=True)
-    time_limit_start = Column(DateTime, nullable=True)
-    time_limit_end = Column(DateTime, nullable=True)
-    actual_time_setup = Column(Integer, nullable=True)
-    order = Column(Integer, nullable=False, server_default=text("0"))
-    distance = Column(Integer, nullable=True)
-    time_distance = Column(Integer, nullable=True)
-    priority = Column(Integer, nullable=False, server_default=text("0"))
-
-    simulated_time_setup = Column(Integer, nullable=True)
-    simulated_window_time_setup = Column(Integer, nullable=True)
-    actual_time_service = Column(Integer, nullable=True)
-    actual_work_duration = Column(Integer, nullable=True)
-    simulated_work_duration = Column(Integer, nullable=True)
-    simulated_start_date = Column(DateTime, nullable=True)
-    simulated_end_date = Column(DateTime, nullable=True)
-    simulated_window_start_date = Column(DateTime, nullable=True)
-    simulated_window_end_date = Column(DateTime, nullable=True)
-    complements = Column(JSONB, nullable=True)
-    simulated_order = Column(Integer, nullable=False, server_default=text("0"))
-    simulated_window_order = Column(Integer, nullable=False, server_default=text("0"))
-    actual_distance = Column(Integer, nullable=True)
-    simulated_distance = Column(Integer, nullable=True)
-    simulated_window_distance = Column(Integer, nullable=True)
-    actual_time_distance = Column(Integer, nullable=True)
-    simulated_time_distance = Column(Integer, nullable=True)
-    simulated_window_time_distance = Column(Integer, nullable=True)
-    status_priority = Column(Integer, nullable=False, server_default=text("25"))
-    created_by = Column(String(32), nullable=False)
-    created_date = Column(DateTime, nullable=False)
-    modified_by = Column(String(32), nullable=False)
-    modified_date = Column(DateTime, nullable=False)
-    __table_args__ = (
             ForeignKeyConstraint(
-                ['client_id', 'simulation_id'],
-                ['simulation.client_id', 'simulation.simulation_id'],
-                name='fk_simulation_jobs_simulation'
+                ['client_id', 'team_id'],
+                ['teams.client_id', 'teams.team_id'],
+                name='fk_simulation_team'
             ),
-            UniqueConstraint('client_id','simulation_id','client_job_id', name='uk_simulation_jobs'),
-        )
-    
-class SimulationResources(Base):
-    __tablename__ = "simulation_resources"
-
-    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
-    client_id = Column(Integer, primary_key=True, nullable=False)
-    simulation_id = Column(Integer, primary_key=True, nullable=False)
-    resource_id  = Column(Integer, primary_key=True, nullable=False)
-    
-    distance_end = Column(Integer, nullable=True)
-    distance_start = Column(Integer, nullable=True)
-    time_distance_start = Column(Integer, nullable=True)
-    time_distance_end = Column(Integer, nullable=True)
-    start_date = Column(DateTime, nullable=True)
-    end_date = Column(DateTime, nullable=True)
-
-
-
-    actual_distance_end = Column(Integer, nullable=True)
-    simulated_distance_end = Column(Integer, nullable=True)
-    simulated_window_distance_start = Column(Integer, nullable=True)
-    simulated_window_distance_end = Column(Integer, nullable=True)
-    actual_time_distance_start = Column(Integer, nullable=True)
-    actual_time_distance_end = Column(Integer, nullable=True)
-    simulated_time_distance_start = Column(Integer, nullable=True)
-    simulated_time_distance_end = Column(Integer, nullable=True)
-    simulated_window_time_distance_start = Column(Integer, nullable=True)
-    simulated_window_time_distance_end = Column(Integer, nullable=True)
-    actual_end_date = Column(DateTime, nullable=True)
-    simulated_end_date = Column(DateTime, nullable=True)
-    simulated_window_end_date = Column(DateTime, nullable=True)
-    simulated_window_start_date = Column(DateTime, nullable=True)
-    created_by = Column(String(32), nullable=False)
-    created_date = Column(DateTime, nullable=False)
-    modified_by = Column(String(32), nullable=False)
-    modified_date = Column(DateTime, nullable=False)
-    __table_args__ = (
-            ForeignKeyConstraint(
-                ['client_id', 'simulation_id'],
-                ['simulation.client_id', 'simulation.simulation_id'],
-                name='fk_simulation_jobs_simulation'
-            ),
-            ForeignKeyConstraint(
-                ['client_id', 'resource_id'],
-                ['resources.client_id', 'resources.resource_id'],
-                name='fk_simulation_jobs_resources'
-            )
+            UniqueConstraint('client_id','user_id', 'team_id','simulation_date', 'session', 'sequence', name='uk_simulation'),
         )    
-    
 
 class Logs(Base):
     __tablename__ = "logs"

@@ -51,15 +51,16 @@ class ResourceUpdateResponse(BaseModel):
     class Config:
         from_attributes = True
 
-class NewRoutesRequest(BaseModel):
+class NewSimulationRequest(BaseModel):
+    team_id: int
+    session: UUID4
     p_date: str
-    resource_id: Optional[int] = None
+    # resources: Optional[List[int]] = None
 
 class ScheduleJobsRequest(BaseModel):
-    resource_id: int
     simulation_id: int
     action: str
-    p_date: str
+    resources: List[int]
     jobs: List[int]
 
 class AllScheduleJobsRequest(BaseModel):
