@@ -60,15 +60,9 @@ class NewSimulationRequest(BaseModel):
 class ScheduleJobsRequest(BaseModel):
     simulation_id: int
     action: str
-    resources: List[int]
-    jobs: List[int]
-
-class AllScheduleJobsRequest(BaseModel):
-    team_id: int
-    simulation_id: int
-    action: str
-    p_date: str
-    jobs: List[int]
+    resources: List[int] | None = None
+    jobs: List[int] | None = None
+    per_resource: Dict[str, Any] | None = None
 
 class SimulationRealTimeJobsRequest(BaseModel):
     team_id: int

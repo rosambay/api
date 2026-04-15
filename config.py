@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     client_uid: int
     mapbox_key: str
     vroom_url: str = "https://routes.imagineit.com.br/routing"
+    osrm_url: str = "https://routes.imagineit.com.br/routes"
+    mapbox_url: str = "https://api.mapbox.com/geocoding/v5/mapbox.places"
 
     class Config:
         env_file = ".env"

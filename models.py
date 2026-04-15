@@ -353,6 +353,8 @@ class Jobs(Base):
     work_duration = Column(Integer, nullable=True)
     plan_start_date = Column(DateTime, nullable=False)
     plan_end_date = Column(DateTime, nullable=False)
+    ajustment_start_date = Column(DateTime, nullable=True)
+    ajustment_end_date = Column(DateTime, nullable=True)
     actual_start_date = Column(DateTime, nullable=True)
     actual_end_date = Column(DateTime, nullable=True)
     time_limit_start = Column(DateTime, nullable=True)

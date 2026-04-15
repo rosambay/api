@@ -72,7 +72,7 @@ async def optimize_routes_vroom(payload: dict) -> dict:
 
 async def get_route_distance(coordinates: List[List[float]]) -> dict:
     coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
-    url = f"https://routes.imagineit.com.br/routes/route/v1/driving/{coords_str}"
+    url = f"{settings.osrm_url}/route/v1/driving/{coords_str}"
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(url, params={"overview": "true"})
@@ -96,7 +96,7 @@ async def get_route_distance(coordinates: List[List[float]]) -> dict:
 async def geocode_mapbox(address: str) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(
-            f"https://api.mapbox.com/geocoding/v5/mapbox.places/{address}.json",
+            f"{settings.mapbox_url}/{address}.json",
             params={"access_token": settings.mapbox_key, "limit": 1},
         )
         response.raise_for_status()
@@ -117,7 +117,7 @@ async def geocode_mapbox(address: str) -> dict:
 
 async def get_route_distance_block(coordinates: List[List[float]]) -> List[dict]:
     coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
-    url = f"https://routes.imagineit.com.br/routes/route/v1/driving/{coords_str}?overview=false"
+    url = f"{settings.osrm_url}/route/v1/driving/{coords_str}?overview=false"
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(url, params={"overview": "false"})

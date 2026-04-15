@@ -733,7 +733,7 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                   MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap,
                   MIN(created_dttm) OVER (PARTITION BY 1) AS first_snap 
             FROM ( 
-                SELECT TOP 5000
+                SELECT TOP 3000
                     t.request_id,
                     t.contr_type,
                     t.task_id, 
