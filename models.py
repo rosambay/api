@@ -92,6 +92,7 @@ class Teams(Base):
     client_team_id = Column(String(32), nullable=False)
     team_name = Column(String(128), nullable=False)
     time_setup = Column(Integer, nullable=True)
+    time_overlap = Column(Integer, nullable=True)
     time_service = Column(Integer, nullable=True)
     start_time = Column(Time, nullable=False, server_default=text("'08:00:00'"))
     end_time = Column(Time, nullable=False, server_default=text("'18:00:00'"))
@@ -154,7 +155,6 @@ class TeamMembers(Base):
             Index('idx_team_members_00', 'modified_date','client_id')
         )
 
-    
 class Resources(Base):
     __tablename__ = "resources"
     client_id = Column(Integer, ForeignKey("clients.client_id"), primary_key=True, nullable=False)
@@ -307,6 +307,7 @@ class JobType(Base):
     job_type_id = Column(Integer, primary_key=True, autoincrement=True)
     client_job_type_id = Column(String(32), nullable=False)
     style_id = Column(Integer, nullable=True)
+    time_overlap = Column(Integer, nullable=True)
     description  = Column(String(128), nullable=False)
     priority = Column(Integer, nullable=False, server_default=text("25"))
     time_setup = Column(Integer, nullable=True)

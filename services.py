@@ -22,9 +22,12 @@ async def optimize_routes_vroom(payload: dict) -> dict:
             response = await client.post(
                 settings.vroom_url,
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Host": "routes.imagineit.com.br",
+                    "Content-Type": "application/json"
+                },
             )
-
+    
         if response.status_code != 200:
             logger.error(
                 "VROOM HTTP {} | url={} | body={}",

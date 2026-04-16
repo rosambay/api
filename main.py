@@ -2861,7 +2861,7 @@ async def scheduleJobs(
             WITH dados AS (
                 SELECT j.client_id
                     ,t.team_id
-                    ,300 time_overlap
+                    ,COALESCE(j.time_overlap, jt.time_overlap, t.time_overlap,0) AS time_overlap
                     ,j.job_id
                     ,j.address_id
                     ,a.geocode_lat::NUMERIC geocode_lat
@@ -2892,11 +2892,6 @@ async def scheduleJobs(
             WHERE   j.client_id = :client_id
                 AND s.simulation_id = :simulation_id
                 AND j.job_id IN ({','.join(str(j) for j in listJobs)})
-                AND a.geocode_lat is not null
-                AND a.geocode_long is not null
-                and (a.geocode_lat::NUMERIC) < 100
-                AND (a.geocode_long::NUMERIC) < 100
-                
             ),
             MapeamentoEnderecos AS (
                 SELECT 
@@ -2926,6 +2921,7 @@ async def scheduleJobs(
                 geocode_lat,
                 geocode_long,
                 time_setup,
+                time_overlap,
                 time_service + (time_overlap * (quantidade_jobs_mesmo_endereco -1)) as time_service,
                 priority,
                 start_time,
@@ -3076,7 +3072,7 @@ async def scheduleJobs(
                         j.team_id,
                         j.job_id,
                         s.simulation_date AS job_day,
-                        300 time_overlap,
+                        COALESCE(j.time_overlap, jt.time_overlap, t.time_overlap,0) AS time_overlap,
                         j.client_job_id,
                         js.description AS status_description,
                         jt.description as type_description,
@@ -3142,6 +3138,7 @@ async def scheduleJobs(
                     q_2.time_distance as time_distance_at,
                     
                     j.job_id,
+                    j.time_overlap,
                     q.geocode_long,
                     q.geocode_lat,
                     q.setup,
@@ -3210,8 +3207,9 @@ async def scheduleJobs(
                     json_agg(
                         json_build_object(
                             'client_id', q.client_id,
-                            'job_id', q.job_id,
                             'team_id', q.team_id,
+                            'job_id', q.job_id,
+                            'time_overlap', q.time_overlap,
                             'client_job_id', q.client_job_id,
                             'status_description', q.status_description,
                             'type_description', q.type_description,
