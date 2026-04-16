@@ -34,6 +34,34 @@ class ViewStylesResponse(BaseModel):
     background: str
     foreground: str
 
+class JobStatusResponse(BaseModel):
+    job_status_id: int
+    client_job_status_id: str
+    style_id: Optional[int] = None
+    description: str
+    internal_code_status: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class JobStatusUpdateRequest(BaseModel):
+    style_id: Optional[int] = None
+    description: Optional[str] = None
+    internal_code_status: Optional[str] = None
+
+class JobRescheduleRequest(BaseModel):
+    plan_start_date: datetime
+    plan_end_date: datetime
+
+class JobRescheduleResponse(BaseModel):
+    job_id: int
+    plan_start_date: datetime
+    plan_end_date: datetime
+    time_service: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
 class ResourceUpdateRequest(BaseModel):
     fl_off_shift: Optional[int] = None
     time_setup: Optional[int] = None

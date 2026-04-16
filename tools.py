@@ -1035,7 +1035,7 @@ async def getTeamMemberMatrix(dateTime: str = None, client_uid: str = None):
             SELECT a.*, 
                   MAX(a.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
              FROM dbo.c_team_member_vw a WITH (NOEXPAND)
-            WHERE a.modified_dttm >=  CAST('{dateTime}' AS datetime)
+            --WHERE a.modified_dttm >=  CAST('{dateTime}' AS datetime)
             ORDER BY a.modified_dttm DESC
             """)
         await client.close()

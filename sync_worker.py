@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.future import select
 from database import engine, Base, SessionLocal
 from config import settings
-from services import optimize_routes_vroom, get_route_distance_block, logs 
+from services import optimize_routes_vroom, get_route_distance_block, logs , geocode_mapbox
 import models
 from auth import get_password_hash
 from tools import (
@@ -43,6 +43,54 @@ async def deleteJobs():
       # await db.execute(smtp)
       await db.commit()
 
+async def checkPendencias():
+    try:
+        smtp = text("""
+            select distinct 
+                a.state_prov, a.city, a.address
+            from address a
+                join jobs j on j.address_id = a.address_id
+            where a.geocode_lat::NUMERIC =0  
+                OR a.geocode_long::NUMERIC = 0
+                OR a.geocode_lat::NUMERIC < -40 
+                OR a.geocode_lat::NUMERIC > 10
+                OR a.geocode_long::NUMERIC < -80 
+                OR a.geocode_long::NUMERIC > -30
+                OR a.geocode_lat is null
+                OR a.geocode_long is null
+                order by a.state_prov, a.city, a.address   
+        """)
+        async with SessionLocal() as db:
+            result = await db.execute(smtp)
+            rows = result.mappings().all()
+            for row in rows:
+                address = f'{row.address}, {row.city}, {row.state_prov}'
+                retorno = await geocode_mapbox(address)
+                geocode_long = retorno["longitude"]
+                geocode_lat = retorno["latitude"]
+                smtp = text("""
+                    update address
+                        set geocode_long = :geocode_long
+                            ,geocode_lat = :geocode_lat
+                        where state_prov = :state_prov
+                        and city = :city
+                        and address = :address
+                """).bindparams(address=row.address, state_prov=row.state_prov, city=row.city, geocode_long=geocode_long, geocode_lat=geocode_lat)
+                result = await db.execute(smtp)
+                await db.commit()
+                print(retorno)
+
+    except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+    
+        # Extrai a última linha da pilha (onde o erro ocorreu)
+        detalhes = traceback.extract_tb(exc_traceback)[-1]
+        
+        arquivo = detalhes.filename
+        linha = detalhes.lineno
+        funcao = detalhes.name
+        logger.error(f"Erro {e}")        
+        logger.error(f"Detalhes: {arquivo}, {linha} , {funcao}")            
 async def buildAdjustmentScheduled():
     try:
         smtp = text("""
@@ -468,8 +516,8 @@ async def buildReports():
                     JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
                     JOIN resources r on r.client_id = j.client_id AND r.resource_id = j.resource_id
                 WHERE js.internal_code_status = 'CONCLU'
-                    AND j.client_id = 1
-                    AND j.team_id = 33
+--                    AND j.client_id = 1
+  --                  AND j.team_id = 33
                     AND COALESCE(j.actual_start_date, j.plan_start_date) < date_trunc('day',NOW())
                     AND NOT EXISTS (SELECT 
                                         1
@@ -490,7 +538,7 @@ async def buildReports():
                 )
                 select 
                     client_id, 
-                    team_id, 
+                    team_id,
                     DATE_TRUNC('day', actual_date) as actual_date, 
                     count(*) total 
                 from qjobs
@@ -599,10 +647,10 @@ async def buildReports():
                             select
                             r.resource_id,
                             r.description,
-                            r.geocode_lat_from::NUMERIC,
-                            r.geocode_long_from::NUMERIC,
-                            r.geocode_lat_at::NUMERIC,
-                            r.geocode_long_at::NUMERIC,
+                            COALESCE(r.geocode_lat_from,t.geocode_lat)::NUMERIC AS geocode_lat_from,
+                            COALESCE(r.geocode_long_from,t.geocode_long)::NUMERIC AS geocode_long_from,
+                            COALESCE(r.geocode_lat_at,t.geocode_lat)::NUMERIC AS geocode_lat_at,
+                            COALESCE(r.geocode_long_at,t.geocode_long)::NUMERIC AS geocode_long_at,
                             EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
                             EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
                             from resources r
@@ -1450,6 +1498,10 @@ async def getResources(r):
                               )  THEN
                       UPDATE SET actual_geocode_lat = t.geocode_lat
                           ,actual_geocode_long = t.geocode_long
+                          ,geocode_lat_from = t.geocode_lat_from
+                          ,geocode_long_from = t.geocode_long_from
+                          ,geocode_lat_at = t.geocode_lat_at
+                          ,geocode_long_at = t.geocode_long_at
                           ,description = t.name
                           --,fl_off_shift = t.work_status --Voltar quando decidir se vai ser pelo cliente
                           ,modified_by = 'INTEGRATION'
@@ -1584,9 +1636,9 @@ async def getAddress(r):
                               last_snap TIMESTAMP)) AS t
                   ON u.client_id = :client_id AND u.client_address_id = t.address_id
                   WHEN MATCHED AND (
-                                 u.geocode_lat IS DISTINCT FROM t.geocode_lat
+                                 u.geocode_lat IS DISTINCT FROM COALESCE(t.geocode_lat,u.geocode_lat)
                               OR u.address IS DISTINCT FROM t.address
-                              OR u.geocode_long IS DISTINCT FROM t.geocode_long
+                              OR u.geocode_long IS DISTINCT FROM COALESCE(t.geocode_long,u.geocode_long)
                               OR u.city IS DISTINCT FROM t.city
                               OR u.state_prov IS DISTINCT FROM t.state_prov
                               OR u.zippost IS DISTINCT FROM t.zippost
@@ -1669,7 +1721,6 @@ async def getPlaces(r):
 
     return
 
-
 async def getGeoPos(r):
     logger.warning("[getGeoPos] Entrou atualização Geo Resource posicionamento...")
 
@@ -1721,7 +1772,6 @@ async def getGeoPos(r):
 
     return
 
-
 async def getLogInOut(r):
     logger.warning("[getLogInOut] Entrou atualização Login...")
 
@@ -1768,7 +1818,6 @@ async def getLogInOut(r):
                     logger.error(f"[getLogInOut] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getTeam(r):
     logger.warning("[getTeam] Entrou atualização dos Times ...")
@@ -1824,7 +1873,6 @@ async def getTeam(r):
                     logger.error(f"[getTeam] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getTeamMember(r):
     logger.warning("[getTeamMember] Entrou atualização Team Member...")
@@ -1884,7 +1932,6 @@ async def getTeamMember(r):
                     logger.error(f"[getTeamMember] Erro ao processar postgres: {e}")
     return
 
-
 async def getJobType(r):
     logger.warning("[getJobType] Entrou atualização de Tipos de Trabalho ...")
 
@@ -1932,7 +1979,6 @@ async def getJobType(r):
                     logger.error(f"[getJobType] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getJobStatus(r):
     logger.warning("[getJobStatus] Entrou atualização de Status de Trabalho ...")
@@ -1988,7 +2034,6 @@ async def getJobStatus(r):
                     logger.error(f"[getJobStatus] Erro ao processar postgres: {e}")
 
     return
-
 
 async def getJobs(r):
 
@@ -2358,9 +2403,8 @@ async def getPriority(r):
 
     return
 
-
 async def processo_em_background(r):
-    SLEEP_NORMAL = 10
+    SLEEP_NORMAL = 60
     SLEEP_MAX = 300
     consecutive_failures = 0
 
@@ -2392,7 +2436,8 @@ async def processo_em_background(r):
                 await getJobStatus(r)
                 await asyncio.sleep(0.2)
                 await calcDistance()
-
+                await asyncio.sleep(0.2)
+                await checkPendencias()
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
                 consecutive_failures = 0
@@ -2411,7 +2456,6 @@ async def processo_em_background(r):
     except asyncio.CancelledError:
         logger.info("Processo contínuo foi encerrado.")
 
-
 async def processo_em_background_longo(r):
     SLEEP_NORMAL = 300
     SLEEP_MAX = 600
@@ -2424,9 +2468,9 @@ async def processo_em_background_longo(r):
                 
                 # await buildAdjustmentScheduled()
                 await buildReports()
-                # await asyncio.sleep(0.5)
-                # await asyncio.sleep(0.5)
                 await asyncio.sleep(0.5)
+                # await asyncio.sleep(0.5)
+                # await asyncio.sleep(0.5)
                 await getPriority(r)
 
                 if consecutive_failures > 0:

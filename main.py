@@ -262,6 +262,86 @@ async def getStyles(
 
     return stylesDb
 
+@app.get("/jobstatus", response_model=List[schemas.JobStatusResponse])
+async def getJobStatus(
+    db: AsyncSession = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    clientId = current_user["clientId"]
+    result = await db.execute(
+        select(models.JobStatus)
+        .where(models.JobStatus.client_id == clientId)
+        .order_by(models.JobStatus.job_status_id)
+    )
+    return result.scalars().all()
+
+@app.patch("/jobstatus/{job_status_id}", response_model=schemas.JobStatusResponse)
+async def updateJobStatus(
+    job_status_id: int,
+    body: schemas.JobStatusUpdateRequest,
+    db: AsyncSession = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    clientId = current_user["clientId"]
+    userId   = current_user["userName"]
+
+    result = await db.execute(
+        select(models.JobStatus).where(
+            models.JobStatus.client_id    == clientId,
+            models.JobStatus.job_status_id == job_status_id
+        )
+    )
+    job_status = result.scalar_one_or_none()
+    if not job_status:
+        raise HTTPException(status_code=404, detail="Status não encontrado")
+
+    updates = body.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(job_status, field, value)
+
+    job_status.modified_by   = str(userId)
+    job_status.modified_date = datetime.now()
+
+    await db.commit()
+    await db.refresh(job_status)
+    return job_status
+
+@app.patch("/jobs/{job_id}/reschedule", response_model=schemas.JobRescheduleResponse)
+async def rescheduleJob(
+    job_id: int,
+    body: schemas.JobRescheduleRequest,
+    db: AsyncSession = Depends(database.get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    clientId = current_user["clientId"]
+    userName = current_user["userName"]
+
+    if body.plan_end_date <= body.plan_start_date:
+        raise HTTPException(status_code=422, detail="plan_end_date deve ser posterior a plan_start_date")
+
+    result = await db.execute(
+        select(models.Jobs).where(
+            models.Jobs.client_id == clientId,
+            models.Jobs.job_id    == job_id
+        )
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    start = body.plan_start_date.replace(tzinfo=None)
+    end   = body.plan_end_date.replace(tzinfo=None)
+
+    job.plan_start_date = start
+    job.plan_end_date   = end
+    job.time_service    = int((end - start).total_seconds())
+    job.modified_by     = str(userName)
+    job.modified_date   = datetime.now()
+
+    await db.commit()
+    await db.refresh(job)
+    return job
+
 @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
 async def getResourceWindows(
     week_day: int = Query(..., description="Dia da semana Inteiro"),
@@ -503,7 +583,7 @@ async def getOpenJobs(
               where ut.client_id = :client_id
                 and ut.user_id = :user_id
                 and j.team_id = :team_id
-                and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') or  js.internal_code_status is null)
+                and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') AND  js.internal_code_status IS NOT NULL)
                  {simulation_filter}
             order by j.team_id, j.resource_id nulls last, j.actual_start_date, j.plan_start_date,  a.geocode_lat, a.geocode_long
         """).bindparams(**bind_params)
@@ -2861,7 +2941,19 @@ async def scheduleJobs(
                 r.geocode_long_from::NUMERIC,
                 r.geocode_lat_at::NUMERIC,
                 r.geocode_long_at::NUMERIC,
-                EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
+                CASE 
+                    WHEN DATE_TRUNC('day',now()) < s.simulation_date
+                        THEN 
+                            EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER
+                    ELSE
+                        CASE 
+                            WHEN (NOW()::TIME > COALESCE(rw.start_time,t.start_time))
+                                THEN
+                                    EXTRACT(EPOCH FROM NOW() - DATE_TRUNC('day',NOW()))::INTEGER
+                            ELSE
+                              EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time))
+                        END
+                END AS start_time,
                 EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
                 from resources r
                 join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
