@@ -12,3 +12,5 @@ lxml
 sqlalchemy
 python-multipart
 uvicorn
+duckdb
+polars

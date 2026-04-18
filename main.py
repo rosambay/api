@@ -7,11 +7,11 @@ import json
 from datetime import date, datetime
 import models, schemas
 from auth import verify_password, create_access_token
-from database import get_db
+from database import get_db, SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, update, delete, exists
 from sqlalchemy.future import select 
-from fastapi import FastAPI, Depends, HTTPException, status,  Response, Request, Query, Form
+from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Query, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import  List, Optional
@@ -21,6 +21,20 @@ from datetime import datetime, timedelta, timezone
 from config import settings
 from loguru import logger
 from services import optimize_routes_vroom, get_route_distance_block, logs
+from contextlib import asynccontextmanager
+import duckdb
+import polars as pl
+from tools import (
+    getJobStatusMatrix, getJobTypeMatrix, getPlaceMatrix, getPriorityMatrix, getResourceWindowMatrix,
+    getStyleMetrix, getResourcesMatrix, getTeamMatrix, getJobsMatrix, getGeoPosMatrix,
+    getTeamMemberMatrix, getLogInOutMatrix, getAdressMatrix
+)
+
+# importa router da versão DuckDB para comparativo de performance
+from schedulejobs_duckdb import router as duckdb_router
+
+dbd = duckdb.connect(':memory:')
+rd = redis_client.get_redis()
 
 async def cleanSessionsRedis(r: Redis, session_web_id: str):
     # await r.delete(f"session:{session_web_id}")
@@ -28,7 +42,1191 @@ async def cleanSessionsRedis(r: Redis, session_web_id: str):
     # await dropUserSession(session_web_id)
     return True
 
-app = FastAPI()
+def oneHour(dateTime: str):
+    data_obj = datetime.strptime(dateTime, '%Y-%m-%d %H:%M:%S')
+    nova_data_obj = data_obj - timedelta(hours=1)
+    return nova_data_obj.strftime('%Y-%m-%d %H:%M:%S')
+
+async def getBackup():
+    ## resources
+    configuracoes = [
+        ('styles', 'style_id'),
+        ('resources', 'resource_id'),
+        ('resource_windows', 'rw_id'),
+        ('teams', 'team_id'),
+        ('team_members', 'team_id'),
+        ('job_types', 'job_type_id'),
+        ('job_status', 'job_status_id'),
+        ('places', 'place_id'),
+        ('address', 'address_id'),
+        ('jobs', 'job_id')
+    ]
+    for table,field in configuracoes:
+        isEmpty = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM {table})").fetchone()[0]
+        if isEmpty:
+            recover = await rd.get(f"{table}:client_id:1")
+            if recover:
+                dados_dict = json.loads(recover)
+                df_data = pl.DataFrame(dados_dict)
+                if not table == 'team_members':
+                    vId, modifiedDate = dbd.execute(f"SELECT COALESCE(MAX({field}),0) + 1, MAX(modified_date) FROM df_data").fetchone()
+                    if modifiedDate:
+                        dbd.execute(F"""
+                            UPDATE snap_time
+                            SET {table} = CAST($p_date AS TIMESTAMP)
+                        """,{"p_date":modifiedDate})
+                        print('A ultima data é ', modifiedDate[:19])
+                    dbd.execute(f"CREATE OR REPLACE SEQUENCE seq_{field} START {int(vId)}")
+                stmt = f"INSERT INTO {table} (SELECT * FROM df_data)"
+                dbd.execute(stmt)
+                result = dbd.execute(f"select count(*) AS Total from {table}").pl().to_dicts()
+                print("Já existe...", result)
+
+async def getResources():
+    logger.warning("[getResources] Entrou atualização dos Recursos ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['resources']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getResourcesMatrix(dateTime, settings.client_uid)
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+
+        try:
+            df_resources = pl.DataFrame(result_rows)
+            stmt = """
+                MERGE INTO resources AS u
+                    USING (SELECT * FROM df_resources) AS t
+                    ON u.client_id = $client_id AND u.client_resource_id = t.person_id
+                    WHEN MATCHED AND (
+                                    u.actual_geocode_lat IS DISTINCT FROM t.geocode_lat
+                                OR u.actual_geocode_long IS DISTINCT FROM t.geocode_long
+                                OR u.geocode_lat_from IS DISTINCT FROM t.geocode_lat_from
+                                OR u.geocode_long_from IS DISTINCT FROM t.geocode_long_from
+                                OR u.geocode_lat_at IS DISTINCT FROM t.geocode_lat_at
+                                OR u.geocode_long_at IS DISTINCT FROM t.geocode_long_at
+                                OR u.description IS DISTINCT FROM t.name
+                                )  THEN
+                        UPDATE SET actual_geocode_lat = t.geocode_lat
+                            ,actual_geocode_long = t.geocode_long
+                            ,geocode_lat_from = t.geocode_lat_from
+                            ,geocode_long_from = t.geocode_long_from
+                            ,geocode_lat_at = t.geocode_lat_at
+                            ,geocode_long_at = t.geocode_long_at
+                            ,description = t.name
+                            ,modified_by = 'INTEGRATION'
+                            ,modified_date = t.modified_dttm
+                    WHEN NOT MATCHED THEN
+                        INSERT (client_id,resource_id, client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
+                        VALUES ($client_id, nextval('seq_resource_id'), t.person_id, t.name, t.work_status, t.geocode_lat, t.geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                    RETURNING merge_action, *;
+                """
+            parametros = {"client_id": 1}     
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows:   
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from resources) AS t
+                                    """).fetchone()[0]
+                await rd.set("resources:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET resources = $dt""",{"dt": last_snap})
+
+
+        except Exception as e:
+            logger.error(f"[getResource] Erro ao processar postgres: {e}")
+
+    return
+
+async def getAddress():
+    logger.warning("[getAddress] Entrou atualização de Endereços ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['address']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getAdressMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            df_dados = pl.DataFrame(result_rows)
+            stmt = """
+                  MERGE INTO address AS u
+                  USING (SELECT * FROM df_dados) AS t
+                  ON u.client_id = $client_id AND u.client_address_id = t.address_id
+                  WHEN MATCHED AND (
+                                 u.geocode_lat IS DISTINCT FROM COALESCE(CAST(t.geocode_lat AS DOUBLE),u.geocode_lat)
+                              OR u.address IS DISTINCT FROM t.address
+                              OR u.geocode_long IS DISTINCT FROM COALESCE(CAST(t.geocode_long AS DOUBLE),u.geocode_long)
+                              OR u.city IS DISTINCT FROM t.city
+                              OR u.state_prov IS DISTINCT FROM t.state_prov
+                              OR u.zippost IS DISTINCT FROM t.zippost
+                              )  THEN
+                      UPDATE SET geocode_lat = t.geocode_lat
+                          ,address = t.address
+                          ,geocode_long = t.geocode_long
+                          ,city = t.city
+                          ,state_prov = t.state_prov
+                          ,zippost = t.zippost
+                          ,modified_by = 'INTEGRATION'
+                          ,modified_date = t.modified_dttm
+                 RETURNING merge_action, *;
+                """
+            parametros = {"client_id": 1}     
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows:   
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from address) AS t
+                                    """).fetchone()[0]
+                await rd.set("address:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET address = $dt""",{"dt": last_snap})
+
+
+        except Exception as e:
+                logger.error(f"[getAddress] Erro ao processar postgres: {e}")
+
+    return
+
+async def getPlaces():
+    logger.info("[getPlaces] Entrou atualização de Locais ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['places']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getPlaceMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            df_dados = pl.DataFrame(result_rows)
+            stmt = """
+                MERGE INTO places AS u
+                  USING (SELECT * FROM df_dados) AS t
+                  ON u.client_id = $client_id AND u.client_place_id = t.place_id
+                  WHEN MATCHED AND (
+                                 u.trade_name IS DISTINCT FROM t.trade_name
+                              OR u.cnpj IS DISTINCT FROM t.cnpj
+                              )  THEN
+                      UPDATE SET trade_name = t.trade_name
+                          ,cnpj = t.cnpj
+                          ,modified_by = 'INTEGRATION'
+                          ,modified_date = t.modified_dttm
+                  RETURNING merge_action, *;
+              """
+            parametros = {"client_id": 1}     
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows:   
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from places) AS t
+                                    """).fetchone()[0]
+                await rd.set("places:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET address = $dt""",{"dt": last_snap})
+            
+
+        except Exception as e:
+                logger.error(f"[getPlaces] Erro ao processar postgres: {e}")
+
+    return
+
+async def getGeoPos():
+    logger.warning("[getGeoPos] Entrou atualização Geo Resource posicionamento...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['geopos']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getGeoPosMatrix(dateTime, settings.client_uid)
+    # print(result_rows)
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            df_dados = pl.DataFrame(result_rows)
+            
+            stmt = """
+                  MERGE INTO resources AS u
+                  USING (SELECT distinct * FROM df_dados) AS t
+                  ON u.client_id = $client_id AND u.client_resource_id = t.modified_by
+                  WHEN MATCHED AND (
+                                 u.actual_geocode_lat IS DISTINCT FROM t.geocode_lat
+                              OR u.actual_geocode_long IS DISTINCT FROM t.geocode_long
+                              ) 
+
+                          THEN
+                      UPDATE SET actual_geocode_lat = t.geocode_lat
+                          ,actual_geocode_long = t.geocode_long
+                          ,modified_date_geo = t.modified_dttm
+                    RETURNING merge_action, *;
+                """
+            parametros = {"client_id": 1}     
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows:   
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from resources) AS t
+                                    """).fetchone()[0]
+                await rd.set("resources:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET geopos = $dt""",{"dt": last_snap})
+            
+        except Exception as e:
+                logger.error(f"[getGeoPos] Erro ao processar postgres: {e}")
+
+    return
+
+
+async def getResourceWindow():
+    logger.warning("[getResourceWindow] Entrou atualização das Janelas de Recursos ...")
+            
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['resource_windows']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getResourceWindowMatrix(dateTime, settings.client_uid)
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            df_resources = pl.DataFrame(result_rows)
+            stmt = """
+                MERGE INTO resource_windows AS u
+                USING (SELECT
+                        x.person_id,
+                        x.work_cal_time_id,
+                        r.resource_id,
+                        cast(x.day_code as integer) as day_code,
+                        x.description,
+                        cast(x.start_tm as time) as start_tm,
+                        cast(x.stop_tm as time) as stop_tm,
+                        x.modified_dttm,
+                        x.last_snap
+                        FROM df_resources x
+                        JOIN resources r ON r.client_resource_id = x.person_id AND r.client_id = $client_id
+                        ) AS t
+                ON u.client_id = $client_id
+                        AND u.resource_id = t.resource_id
+                        AND u.client_rw_id = t.work_cal_time_id
+                WHEN MATCHED AND (
+                            u.description IS DISTINCT FROM t.description
+                            OR u.start_time IS DISTINCT FROM t.start_tm
+                            OR u.end_time IS DISTINCT FROM t.stop_tm
+                            OR u.week_day IS DISTINCT FROM t.day_code
+                            )  THEN
+                    UPDATE SET description = t.description
+                        ,start_time = t.start_tm
+                        ,end_time = t.stop_tm
+                        ,week_day = t.day_code
+                        ,modified_date = t.modified_dttm
+                        ,modified_by = 'INTEGRATION'
+                WHEN NOT MATCHED THEN
+                    INSERT (client_id, rw_id, resource_id, client_rw_id, description, start_time, end_time, week_day, created_by, created_date, modified_by, modified_date)
+                    VALUES ($client_id, nextval('seq_rw_id'), t.resource_id, t.work_cal_time_id, t.description, t.start_tm, t.stop_tm, t.day_code,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                RETURNING merge_action, *;
+            """
+            parametros = {"client_id": 1}
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from resource_windows) AS t
+                                    """).fetchone()[0]
+                await rd.set("resource_windows:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from resource_windows").pl().to_dicts()
+            print(result)
+            
+
+            dbd.execute("""
+                update snap_time
+                    SET resource_windows = $dt""",{"dt": last_snap})
+
+
+        except Exception as e:
+                logger.error(f"[getResourceWindow] Erro ao processar postgres: {e}")
+
+    return
+
+async def getStyle():
+    logger.warning("[getStyle] Entrou atualização de estilos...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['styles']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getStyleMetrix(dateTime, settings.client_uid)
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        dbd.execute("""
+                update snap_time
+                    SET styles = $dt""",{"dt": last_snap})
+        try:
+            def garantir_colunas(df: pl.DataFrame, colunas: list) -> pl.DataFrame:
+                for col in colunas:
+                    if col not in df.columns:
+                        df = df.with_columns(pl.lit(None).alias(col))
+                return df
+            
+
+            df_styles = pl.DataFrame(result_rows)
+            
+            df_styles = garantir_colunas(df_styles, ["font_weight", "background", "foreground"])
+
+            parametros = {"client_id": 1}
+
+            stmt = """
+                    MERGE INTO styles AS u
+                    USING (
+                        SELECT 
+                            item_style_id,
+                            font_weight,
+                            COALESCE(background, '#FFFFFF') AS background,
+                            COALESCE(foreground, '#000000') AS foreground,
+                            modified_dttm,
+                            last_snap
+                        from df_styles) AS t
+                    ON u.client_id = $client_id AND u.client_style_id = t.item_style_id
+                    WHEN MATCHED AND (
+                                 u.font_weight IS DISTINCT FROM t.font_weight
+                              OR u.background IS DISTINCT FROM t.background
+                              OR u.foreground IS DISTINCT FROM t.foreground
+                              )  THEN
+                      UPDATE SET font_weight = t.font_weight
+                          ,background = t.background
+                          ,foreground = t.foreground
+                          ,modified_by = 'INTEGRATION'
+                          ,modified_date = t.modified_dttm
+                    WHEN NOT MATCHED THEN
+                          INSERT (client_id, style_id, client_style_id, font_weight, background, foreground, created_by, created_date, modified_by, modified_date)
+                        VALUES ($client_id, nextval('seq_style_id'), t.item_style_id, t.font_weight, t.background, t.foreground,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from styles) AS t
+                                    """).fetchone()[0]
+                await rd.set("styles:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from styles").pl().to_dicts()
+            print(result)
+        except Exception as e:
+                    logger.error(f"Erro ao processar postgres: {e}")
+    
+
+    return
+
+async def getTeamMember():
+    logger.warning("[getTeamMember] Entrou atualização Team Member...")
+
+    tempDateTime = (datetime.now() - timedelta(days=365 * 2))
+    dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+
+    result_rows = await getTeamMemberMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        try:
+            df_team_member = pl.DataFrame(result_rows)
+            
+            parametros = {"client_id": 1}
+
+            stmt = """
+                    MERGE INTO team_members AS u
+                        USING (
+                            SELECT
+                            x.modified_dttm,
+                            tm.team_id,
+                            r.resource_id,
+                            x.last_snap,
+                            x.person_id
+                        FROM df_team_member x
+                        JOIN teams tm ON tm.client_team_id = x.team_id and tm.client_id = $client_id
+                        JOIN resources r ON r.client_resource_id = x.person_id and r.client_id = $client_id
+                    ) AS t
+                    ON u.client_id = $client_id AND u.resource_id = t.resource_id AND u.team_id = t.team_id
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, team_id, resource_id, created_by,created_date, modified_by, modified_date)
+                      VALUES ($client_id, t.team_id, t.resource_id, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
+                  RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from team_members) AS t
+                                    """).fetchone()[0]
+                await rd.set("team_members:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+            result = dbd.execute("select count(*) as total from team_members").pl().to_dicts()
+            print(result)
+        except Exception as e:
+                    logger.error(f"Erro ao processar postgres: {e}")
+    
+
+    return
+
+async def getJobs():
+    
+    logger.warning("[getJobs] Entrou atualização das Tarefas ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['jobs']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getJobsMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        dbd.execute("""
+                update snap_time
+                    SET jobs = $dt""",{"dt": last_snap})
+      
+    #   first_snap = result_rows[0]['first_snap'][:19].replace('T', ' ')
+        try:
+            df_jobs = pl.DataFrame(result_rows)
+            parametros = {"client_id": 1}
+            
+            # Resources create
+            stmt = """
+                    MERGE INTO resources AS u
+                    USING (
+                        SELECT DISTINCT 
+                            person_id,
+                            resource_name,
+                            resource_geocode_lat,
+                            resource_geocode_long,
+                            geocode_lat_from,
+                            geocode_long_from,
+                            geocode_lat_at,
+                            geocode_long_at,
+                            work_status,
+                            resource_modified_dttm
+                        from df_jobs
+                        WHERE person_id IS NOT NULL ) AS t
+                    ON u.client_id = $client_id AND u.client_resource_id = t.person_id
+                    WHEN NOT MATCHED THEN
+                        INSERT (client_id, resource_id, client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
+                        VALUES ($client_id, nextval('seq_resource_id'), t.person_id, t.resource_name, t.work_status, t.resource_geocode_lat, t.resource_geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.resource_modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from resources) AS t
+                                    """).fetchone()[0]
+                await rd.set("resources:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from resources").pl().to_dicts()
+            print(result)
+
+            # Teams create
+            stmt = """
+                    MERGE INTO teams AS u
+                  USING (
+                      SELECT DISTINCT 
+                        team_id AS client_team_id,
+                        desc_team,
+                        team_modified_dttm
+                       from df_jobs
+                      ) AS t
+                  ON u.client_id = $client_id AND u.client_team_id = t.client_team_id
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, team_id, client_team_id, team_name, created_by, created_date, modified_by, modified_date)
+                      VALUES ($client_id, nextval('seq_team_id'), t.client_team_id, t.desc_team, 'INTEGRATION', NOW(), 'INTEGRATION', t.team_modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from teams) AS t
+                                    """).fetchone()[0]
+                await rd.set("teams:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from teams").pl().to_dicts()
+            print(result)
+            # Job Types create
+            stmt = """
+                MERGE INTO job_types AS u
+                  USING (
+                      SELECT DISTINCT 
+                           task_type,
+                           desc_task_type,
+                           task_type_modified_dttm
+                        FROM df_jobs
+                      ) AS t
+                  ON u.client_id = $client_id AND u.client_job_type_id = t.task_type
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, job_type_id, client_job_type_id, description, created_by, created_date, modified_by, modified_date)
+                      VALUES ($client_id, nextval('seq_job_type_id'), t.task_type, t.desc_task_type, 'INTEGRATION', NOW(), 'INTEGRATION', t.task_type_modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from job_types) AS t
+                                    """).fetchone()[0]
+                await rd.set("job_types:client_id:1",result)
+            result = dbd.execute("select count(*) as total from job_types").pl().to_dicts()
+            print(result)
+            # Job status create
+            stmt = """
+                MERGE INTO job_status AS u
+                  USING (
+                      SELECT DISTINCT
+                           s.style_id,
+                           x.task_status,
+                           x.desc_task_status,
+                           x.item_style_id,
+                           x.task_status_modified_dttm
+                        FROM df_jobs x
+                        LEFT JOIN styles s ON x.item_style_id = s.client_style_id AND s.client_id = $client_id
+                      ) AS t
+                  ON u.client_id = $client_id AND u.client_job_status_id = t.task_status
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, job_status_id, client_job_status_id, style_id, description, created_by, created_date, modified_by, modified_date)
+                      VALUES ($client_id, nextval('seq_job_status_id'), t.task_status, t.style_id, t.desc_task_status, 'INTEGRATION', NOW(), 'INTEGRATION', t.task_status_modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from job_status) AS t
+                                    """).fetchone()[0]
+                await rd.set("job_status:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from job_types").pl().to_dicts()
+            print(result)
+            # Places create
+            stmt = """
+                MERGE INTO places AS u
+                  USING (
+                      SELECT DISTINCT
+                           place_id AS client_place_id,
+                           trade_name,
+                           cnpj,
+                           place_modified_dttm
+                        FROM df_jobs) AS t
+                  ON u.client_id = $client_id AND u.client_place_id = t.client_place_id
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, place_id, client_place_id, trade_name, cnpj, created_by, created_date, modified_by, modified_date)
+                      VALUES ($client_id, nextval('seq_place_id'), t.client_place_id, t.trade_name, t.cnpj, 'INTEGRATION', NOW(), 'INTEGRATION', t.place_modified_dttm)
+                    RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from places) AS t
+                                    """).fetchone()[0]
+                await rd.set("places:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from places").pl().to_dicts()
+            print(result)
+
+            # Address create
+            stmt = """
+                MERGE INTO address AS u
+                  USING (
+                      SELECT DISTINCT
+                           address_id AS client_address_id,
+                           address,
+                           geocode_lat,
+                           geocode_long,
+                           city,
+                           state_prov,
+                           zippost,
+                           address_modified_dttm
+                        FROM df_jobs) AS t
+                  ON u.client_id = $client_id AND u.client_address_id = t.client_address_id
+                  WHEN NOT MATCHED THEN
+                  INSERT (client_id, address_id, client_address_id, address, geocode_lat, geocode_long, city , state_prov, zippost, created_by, created_date, modified_by, modified_date)
+                  VALUES ($client_id, nextval('seq_address_id'), t.client_address_id, t.address, t.geocode_lat, t.geocode_long, t.city, t.state_prov, t.zippost, 'INTEGRATION', NOW(), 'INTEGRATION', t.address_modified_dttm)
+                  RETURNING merge_action, *;
+                    """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from address) AS t
+                                    """).fetchone()[0]
+                await rd.set("address:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from address").pl().to_dicts()
+            print(result)
+
+            #   sao_iguais = df_jobs.equals(df_jobs_old)
+            #   df_jobs_old = df_jobs
+            #   if sao_iguais:
+            #       logger.warning('São Iguais...')
+            
+            #   json_jobs = json.dumps(result_rows)
+
+            #   print(json_jobs)
+            #   result = dbd.execute("select * from df_jobs").pl().to_dicts()
+            #   print(result)
+            
+            
+            #    #Criação e atualização do Job
+            stmt = """
+                MERGE INTO jobs AS u
+                USING (
+                    SELECT x.*, 
+                        CONCAT(x.request_id, '|', x.task_id) AS client_job_id,
+                        t.team_id AS team_idd,
+                        r.resource_id,
+                        a.address_id AS address_idd,
+                        p.place_id AS place_idd,
+                        jt.job_type_id,
+                        js.job_status_id
+                    FROM df_jobs x
+                    LEFT JOIN resources r ON x.person_id = r.client_resource_id AND $client_id = r.client_id
+                    JOIN teams t ON t.client_team_id = x.team_id AND t.client_id = $client_id
+                    join address a ON a.client_address_id = x.address_id AND a.client_id = $client_id
+                    JOIN job_types jt ON jt.client_job_type_id = x.task_type AND jt.client_id = $client_id
+                    JOIN job_status js ON js.client_job_status_id = x.task_status AND js.client_id = $client_id
+                    JOIN places p ON p.client_place_id = x.place_id AND p.client_id = $client_id    
+                        ) AS t
+                ON u.client_id = $client_id AND u.client_job_id = t.client_job_id
+                WHEN MATCHED AND (
+                            u.team_id IS DISTINCT FROM t.team_idd
+                            OR u.resource_id IS DISTINCT FROM t.resource_id
+                            OR u.address_id IS DISTINCT FROM t.address_idd
+                            OR u.place_id IS DISTINCT FROM t.place_idd
+                            OR u.job_type_id IS DISTINCT FROM t.job_type_id
+                            OR u.job_status_id IS DISTINCT FROM t.job_status_id
+                            OR u.work_duration IS DISTINCT FROM t.work_duration::INTEGER
+                            OR u.plan_start_date IS DISTINCT FROM t.plan_start_dttm
+                            OR u.plan_end_date IS DISTINCT FROM t.plan_end_dttm
+                            OR u.actual_start_date IS DISTINCT FROM t.actual_start_dttm
+                            OR u.actual_end_date IS DISTINCT FROM t.actual_end_dttm
+                            OR u.time_limit_end IS DISTINCT FROM t.sla
+                            OR u.time_limit_start IS DISTINCT FROM t.plan_start_dttm
+                            OR u.time_service IS DISTINCT FROM t.plan_task_dur_min
+                            ) THEN
+                    UPDATE SET team_id = t.team_idd
+                        ,resource_id = t.resource_id
+                        ,address_id = t.address_idd
+                        ,place_id = t.place_idd
+                        ,job_type_id = t.job_type_id
+                        ,job_status_id = t.job_status_id
+                        ,work_duration = t.work_duration::INTEGER
+                        ,plan_start_date = t.plan_start_dttm
+                        ,plan_end_date = t.plan_end_dttm
+                        ,actual_start_date = t.actual_start_dttm
+                        ,actual_end_date = t.actual_end_dttm
+                        ,time_limit_end = t.sla
+                        ,time_limit_start = t.plan_start_dttm
+                        ,time_service = t.plan_task_dur_min
+                        ,modified_date = t.modified_dttm
+                WHEN NOT MATCHED THEN
+                    INSERT (client_id, job_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, created_by, created_date, modified_by, modified_date)
+                    VALUES ($client_id, nextval('seq_job_id'), t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, 'INTEGRATION', t.created_dttm, 'INTEGRATION', t.modified_dttm)
+                RETURNING merge_action, *;
+            """
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                result = dbd.execute("""
+                    SELECT to_json(list(t)) 
+                        FROM (select * from jobs) AS t
+                                    """).fetchone()[0]
+                await rd.set("jobs:client_id:1",result)
+                for row in rows:
+                    print(row["merge_action"])
+
+            result = dbd.execute("select count(*) as total from jobs").pl().to_dicts()
+            print(result)
+
+            dbd.execute("""
+            CREATE TABLE IF NOT EXISTS user_team AS
+                    select client_id, 1 as user_id, team_id from teams
+                     where client_team_id = '48898';
+                    """)
+
+            result  = dbd.execute("select * from user_team").pl().to_dicts()
+            print(result)
+            #   async with SessionLocal() as db:
+            #     result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
+            #     await db.commit()
+            #     for row in result:
+            #         type = row.merge_action + ' ON JOB'
+            #         logger.info(f"ID: {row.job_id} | Ação JOB realizada: {row.merge_action}")
+
+            #   await r.set(snapKey, last_snap)
+        except Exception as e:
+                    logger.error(f"[getJobs] Erro ao processar postgres: {e}")
+    return
+
+async def processo_em_background():
+    SLEEP_NORMAL = 10
+    SLEEP_MAX = 300
+    consecutive_failures = 0
+
+    try:
+        while True:
+            try:
+                # await getStyle(r)
+                # await asyncio.sleep(0.5)
+                # await getPerson(r)
+                # await asyncio.sleep(0.5)
+                # await getAddress(r)
+                # await asyncio.sleep(0.5)
+                # await getGeoPos(r)
+                # await asyncio.sleep(0.5)
+                # await getLogInOut(r)
+                # await asyncio.sleep(0.5)
+                # await getTeamMember(r)
+                # await asyncio.sleep(0.5)
+                # await getTasksNoPerson(r)
+                # await asyncio.sleep(0.5)
+                await getBackup()
+                await asyncio.sleep(0.5)
+                await getStyle()
+                await asyncio.sleep(0.5)
+                await getJobs()
+                await asyncio.sleep(0.5)
+                await getResources()
+                await asyncio.sleep(0.5)
+                await getGeoPos()
+                await asyncio.sleep(0.5)
+                await getResourceWindow()
+                await asyncio.sleep(0.5)
+                await getTeamMember()
+                await asyncio.sleep(0.5)
+                await getAddress()
+                await asyncio.sleep(0.5)
+                await getPlaces()
+
+                if consecutive_failures > 0:
+                    logger.info(f"Background task recuperada após {consecutive_failures} falha(s) consecutiva(s).")
+                consecutive_failures = 0
+                sleep_time = SLEEP_NORMAL
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_failures += 1
+                sleep_time = min(SLEEP_NORMAL * (2 ** consecutive_failures), SLEEP_MAX)
+                logger.error(f"Erro na iteração do background task (falha #{consecutive_failures}): {e}. Próxima tentativa em {sleep_time}s.")
+
+            logger.info(f'Aguardando {sleep_time}s para próximo refresh ...')
+            await asyncio.sleep(sleep_time)
+            
+            # teve_alteracao = False
+
+            # if result_rows:
+            #     for chamado in result_rows:
+            #         data_str = chamado['c_plan_start_date'][:19].replace('T', ' ')
+            #         data_alvo = datetime.strptime(data_str, '%Y-%m-%d %H:%M:%S')
+            #         tmpDateTime = (datetime.now() - timedelta(days=30))
+            #         diferenca = data_alvo - tmpDateTime
+            #         TEMPO_EXPIRACAO_SEGUNDOS = int(diferenca.total_seconds())
+            #         if TEMPO_EXPIRACAO_SEGUNDOS < 0:
+            #             TEMPO_EXPIRACAO_SEGUNDOS = 0
+
+            #         chave_unica = f"chamado:{chamado['request_id']}:{chamado['task_id']}"
+                    
+            #         await r.set('snap_time', datetime.fromisoformat(chamado['last_snap'].replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S'))  # Atualiza o snap_time a cada execução
+                    
+            #         valor_json = json.dumps(chamado, sort_keys=True)
+                        
+            #         planStartDate = chamado.get('c_plan_start_date', '').split('T')[0]
+            #         chave_indice = f"idx:plan_start_date:{planStartDate}"
+
+            #         try:
+            #             resultado = await update_if_different(
+            #                 keys=[chave_unica, chave_indice], 
+            #                 args=[valor_json, TEMPO_EXPIRACAO_SEGUNDOS]
+            #             )
+                        
+            #             if resultado == 1:
+            #                 teve_alteracao = True
+            #                 await criar_e_enviar_notificacao(r, "chamado_alterado", "Chamado Alterado", dados_extra=chamado)
+            #             else:
+            #               await criar_e_enviar_notificacao(r, "chamado_alterado", "Chamado Alterado", dados_extra=chamado)  
+
+            #         except Exception as e:
+            #             logger.error(f"Erro ao processar {chave_unica}: {e}")
+
+            # if teve_alteracao:
+            #     logger.info("Alterações detectadas! Reconstruindo a árvore de cache...")
+                
+                # listKeys = await r.sunion("cache:arvore_times:*")
+                # for key in listKeys:
+                #     await atualizar_cache_arvore(r, key)
+                #     logger.info(f"Nova árvore salva no cache com sucesso! Chave: {key}")
+            
+    except asyncio.CancelledError:
+        logger.info("Processo contínuo foi encerrado.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # r = redis_client.get_redis()
+    # await r.flushall()
+
+    dbd.execute("""
+        CREATE TABLE IF NOT EXISTS snap_time AS
+            SELECT CURRENT_DATE - INTERVAL 45 DAY AS jobs,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS styles,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS resources,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS resource_windows,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS teams,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS job_types,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS job_status,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS places,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS address,
+                CURRENT_DATE - INTERVAL (365*2) DAY AS geopos;
+        CREATE SEQUENCE IF NOT EXISTS seq_job_id;
+        CREATE TABLE IF NOT EXISTS jobs (
+            uid                     UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_id               INTEGER NOT NULL,
+            job_id                  INTEGER NOT NULL,
+            client_job_id           VARCHAR NOT NULL,
+            team_id                 INTEGER NULL,
+            resource_id             INTEGER NULL,
+            job_status_id           INTEGER NULL,
+            job_type_id             INTEGER NULL,
+            address_id              INTEGER NULL,
+            place_id                INTEGER NULL,
+            priority                INTEGER DEFAULT 0 NOT NULL,
+            time_setup              INTEGER,
+            time_service            INTEGER,
+            time_overlap            INTEGER,
+            distance                INTEGER DEFAULT 0 NOT NULL,
+            time_distance           INTEGER DEFAULT 0 NOT NULL,
+            work_duration           INTEGER DEFAULT 0 NOT NULL,
+            plan_start_date         TIMESTAMP NOT NULL,
+            plan_end_date           TIMESTAMP NOT NULL,
+            ajustment_start_date    TIMESTAMP NULL,
+            ajustment_end_date      TIMESTAMP NULL,
+            actual_start_date       TIMESTAMP NULL,
+            actual_end_date         TIMESTAMP NULL,
+            time_limit_start        TIMESTAMP NULL,
+            time_limit_end          TIMESTAMP NULL,
+            complements             JSON NULL,
+            created_by              VARCHAR NOT NULL,
+            created_date            TIMESTAMP NOT NULL,
+            modified_by             VARCHAR NOT NULL,
+            modified_date           TIMESTAMP NOT NULL,
+            PRIMARY KEY (client_id, job_id),
+            UNIQUE (client_id, client_job_id) );
+
+        CREATE SEQUENCE IF NOT EXISTS seq_resource_id;        
+        CREATE TABLE IF NOT EXISTS resources (
+            uid                     UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_id               INTEGER NOT NULL,
+            resource_id             INTEGER NOT NULL,
+            client_resource_id      VARCHAR NOT NULL,
+            description             VARCHAR NOT NULL,
+            actual_geocode_lat DOUBLE,
+            actual_geocode_long DOUBLE,
+            geocode_lat_from DOUBLE,
+            geocode_long_from DOUBLE,
+            geocode_lat_at DOUBLE,
+            geocode_long_at DOUBLE,
+            fl_off_shift INTEGER DEFAULT 0 NOT NULL,
+            logged_in TIMESTAMP,
+            logged_out TIMESTAMP,
+            time_setup INTEGER,
+            time_service INTEGER,
+            time_overlap INTEGER,
+            created_by              VARCHAR NOT NULL,
+            created_date            TIMESTAMP NOT NULL,
+            modified_by             VARCHAR NOT NULL,
+            modified_date           TIMESTAMP NOT NULL,
+            modified_date_geo TIMESTAMP NOT NULL,
+            modified_date_login TIMESTAMP NOT NULL,
+                 PRIMARY KEY (client_id, resource_id),
+                 UNIQUE (client_id, client_resource_id)
+        );
+
+        CREATE SEQUENCE IF NOT EXISTS seq_team_id;
+        CREATE TABLE IF NOT EXISTS teams (
+            client_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_team_id VARCHAR NOT NULL,
+            team_name VARCHAR NOT NULL,
+            time_setup INTEGER,
+            time_overlap INTEGER,
+            time_service INTEGER,
+            start_time TIME NOT NULL DEFAULT '08:00:00',
+            end_time TIME NOT NULL DEFAULT '18:00:00',
+            geocode_lat DOUBLE,
+            geocode_long DOUBLE,
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            PRIMARY KEY (client_id, team_id),
+            UNIQUE (client_id, client_team_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_team_00 ON teams (client_team_id, client_id);
+        CREATE INDEX IF NOT EXISTS idx_team_01 ON teams (modified_date, client_id);
+
+        -- 3. Tabela: job_status
+        CREATE SEQUENCE IF NOT EXISTS seq_job_status_id;
+
+        CREATE TABLE IF NOT EXISTS job_status (
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_id INTEGER NOT NULL,
+            job_status_id INTEGER NOT NULL,
+            client_job_status_id VARCHAR NOT NULL,
+            style_id INTEGER,
+            description VARCHAR NOT NULL,
+            internal_code_status VARCHAR, 
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+
+            PRIMARY KEY (client_id, job_status_id),
+            UNIQUE (client_id, client_job_status_id),
+            
+        );
+
+        -- 4. Tabela: job_types
+        CREATE SEQUENCE IF NOT EXISTS seq_job_type_id;
+        CREATE TABLE IF NOT EXISTS job_types (
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_id INTEGER NOT NULL,
+            job_type_id INTEGER NOT NULL,
+            client_job_type_id VARCHAR NOT NULL,
+            style_id INTEGER,
+            description VARCHAR NOT NULL,
+           
+            priority INTEGER NOT NULL DEFAULT 25,
+            
+            time_setup INTEGER,
+            time_service INTEGER,
+            time_overlap INTEGER,
+            
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            
+            -- Constraints de Integridade
+            PRIMARY KEY (client_id, job_type_id),
+            UNIQUE (client_id, client_job_type_id),
+            
+        );
+        CREATE SEQUENCE IF NOT EXISTS seq_style_id;
+
+        -- 2. Tabela: styles
+        CREATE TABLE IF NOT EXISTS styles (
+            client_id INTEGER NOT NULL,
+            
+            style_id INTEGER NOT NULL,
+            
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            
+            client_style_id VARCHAR,
+            font_weight VARCHAR,
+            
+            background VARCHAR NOT NULL DEFAULT '#FFFFFF',
+            foreground VARCHAR NOT NULL DEFAULT '#000000',
+            
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            
+            PRIMARY KEY (client_id, style_id),
+            
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_styles_01 ON styles (modified_date, client_id);
+        
+        -- 2. Tabela: places
+
+        CREATE SEQUENCE IF NOT EXISTS seq_place_id;
+                
+        CREATE TABLE IF NOT EXISTS places (
+            client_id INTEGER NOT NULL,
+            place_id INTEGER NOT NULL,
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_place_id VARCHAR NOT NULL,
+            trade_name VARCHAR,
+            cnpj VARCHAR,
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            PRIMARY KEY (client_id, place_id),
+            
+            CONSTRAINT uk_place UNIQUE (client_id, client_place_id),
+            
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_place_00 ON places (client_place_id, client_id);
+        CREATE INDEX IF NOT EXISTS idx_place_01 ON places (modified_date, client_id);
+
+        -- 2. Tabela: address
+
+        CREATE SEQUENCE IF NOT EXISTS seq_address_id;
+        CREATE TABLE IF NOT EXISTS address (
+            client_id INTEGER NOT NULL,
+            address_id INTEGER NOT NULL,
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            client_address_id VARCHAR NOT NULL,
+            geocode_lat DOUBLE,
+            geocode_long DOUBLE,
+            address VARCHAR,
+            city VARCHAR,
+            state_prov VARCHAR,
+            zippost VARCHAR,
+            time_setup INTEGER,
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            PRIMARY KEY (client_id, address_id),
+            
+            CONSTRAINT uk_address UNIQUE (client_id, client_address_id)
+        );
+            
+        CREATE INDEX IF NOT EXISTS idx_address_00 ON address (client_address_id, client_id);
+        CREATE INDEX IF NOT EXISTS idx_address_01 ON address (modified_date, client_id);
+                
+        -- 2. Tabela: team_members
+
+        CREATE TABLE IF NOT EXISTS team_members (
+            client_id INTEGER NOT NULL,
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            team_id INTEGER NOT NULL,
+            resource_id INTEGER NOT NULL,
+            created_by VARCHAR NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+            PRIMARY KEY (client_id, team_id, resource_id)
+        );
+        
+        -- resource windows
+        CREATE SEQUENCE IF NOT EXISTS seq_rw_id;
+
+        CREATE TABLE IF NOT EXISTS resource_windows (
+            client_id INTEGER NOT NULL,
+            resource_id INTEGER NOT NULL,
+            rw_id INTEGER PRIMARY KEY,
+            client_rw_id VARCHAR NOT NULL,
+            
+            uid UUID UNIQUE DEFAULT gen_random_uuid(),
+            
+            week_day INTEGER NOT NULL,
+            style_id INTEGER,
+            description VARCHAR(128) NOT NULL,
+
+            start_time TIME NOT NULL,
+            end_time TIME NOT NULL,
+            
+            created_by VARCHAR(32) NOT NULL,
+            created_date TIMESTAMP NOT NULL,
+            modified_by VARCHAR(32) NOT NULL,
+            modified_date TIMESTAMP NOT NULL,
+
+            CONSTRAINT fk_resource_windows_styles 
+                FOREIGN KEY (client_id, style_id) REFERENCES styles (client_id, style_id),
+                
+            CONSTRAINT uk_resource_windows 
+                UNIQUE (client_id, resource_id, week_day, start_time, end_time),
+
+            CONSTRAINT ck_resource_window_week_day 
+                CHECK (week_day >= 1 AND week_day <= 7)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_resource_windows_01 ON resource_windows (modified_date, client_id);
+    """)
+    
+    async with SessionLocal() as db:
+        rClient = await db.execute(select(models.Clients.__table__))
+        clientDb = rClient.mappings().all()
+        df_client = pl.DataFrame(clientDb)
+        result = dbd.execute("""
+            CREATE TABLE IF NOT EXISTS clients AS
+                    select * from df_client;
+                    """)
+    r = redis_client.get_redis()
+    task = asyncio.create_task(processo_em_background())
+    yield
+        
+    task.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+
+app.include_router(duckdb_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -342,45 +1540,129 @@ async def rescheduleJob(
     await db.refresh(job)
     return job
 
+# @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
+# async def getResourceWindows(
+#     week_day: int = Query(..., description="Dia da semana Inteiro"),
+#     db: AsyncSession = Depends(database.get_db),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     user_id = current_user["userId"]
+#     client_id = current_user["clientId"]
+
+#     result = await db.execute(
+#         select(models.ResourceWindows)
+#         .join(models.TeamMembers,
+#               (models.TeamMembers.resource_id == models.ResourceWindows.resource_id) &
+#               (models.TeamMembers.client_id == models.ResourceWindows.client_id))
+#         .join(models.UserTeam,
+#               (models.UserTeam.team_id == models.TeamMembers.team_id) &
+#               (models.UserTeam.client_id == models.TeamMembers.client_id))
+#         .where(
+#             models.UserTeam.user_id == user_id,
+#             models.UserTeam.client_id == client_id,
+#             models.ResourceWindows.week_day == week_day
+#         )
+#         .distinct()
+#     )
+#     resourceWindowDb = result.scalars().all()
+
+#     return resourceWindowDb
+
 @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
 async def getResourceWindows(
     week_day: int = Query(..., description="Dia da semana Inteiro"),
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    user_id = current_user["userId"]
-    client_id = current_user["clientId"]
+    userId = current_user["userId"]
+    clientId = current_user["clientId"]
 
-    result = await db.execute(
-        select(models.ResourceWindows)
-        .join(models.TeamMembers,
-              (models.TeamMembers.resource_id == models.ResourceWindows.resource_id) &
-              (models.TeamMembers.client_id == models.ResourceWindows.client_id))
-        .join(models.UserTeam,
-              (models.UserTeam.team_id == models.TeamMembers.team_id) &
-              (models.UserTeam.client_id == models.TeamMembers.client_id))
-        .where(
-            models.UserTeam.user_id == user_id,
-            models.UserTeam.client_id == client_id,
-            models.ResourceWindows.week_day == week_day
-        )
-        .distinct()
-    )
-    resourceWindowDb = result.scalars().all()
+    parametros = {
+        "client_id": clientId,
+        "user_id": userId,
+        "week_day": week_day
+        }
+    result = dbd.execute("""
+        select distinct rw.* 
+            from resource_windows rw
+          join team_members tm ON tm.client_id = rw.client_id and tm.resource_id = rw.resource_id
+          join user_team ut ON ut.client_id = tm.client_id and ut.team_id = tm.team_id
+            where rw.client_id = $client_id
+              and ut.user_id = $user_id
+              and rw.week_day = $week_day
+    """,parametros).pl().to_dicts()
 
-    return resourceWindowDb
+    return result
+# @app.get("/resourcestree")
+# async def getResourcesTree(
+#     db: AsyncSession = Depends(database.get_db),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     user_id = current_user["userId"]
+#     client_id = current_user["clientId"]
+
+#     try:
+#         # Tenta executar uma query simples no banco
+#         smtp = text("""
+#           with q1 as (
+#             select 
+#             client_id,
+#             resource_id,
+#             uid as resource_uid,
+#             client_resource_id,
+#             description,
+#             actual_geocode_lat,
+#             actual_geocode_long,
+#             geocode_lat_from,
+#             geocode_long_from,
+#             geocode_lat_at,
+#             geocode_long_at,
+#             fl_off_shift,
+#             time_setup,
+#             time_service,
+#             time_overlap,
+#             logged_in,
+#             logged_out,
+#             modified_date
+#             from resources
+#           )
+#           select t.team_id,
+#           t.uid AS team_uid,
+#           t.client_team_id,
+#           t.team_name,
+#           jsonb_agg(to_jsonb(q1) ORDER BY q1.description) AS resources
+#           from teams t
+#           join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
+#           join team_members tm on tm.client_id = t.client_id and  tm.team_id = t.team_id
+#           join q1 on q1.client_id = t.client_id and q1.resource_id = tm.resource_id
+#           where ut.client_id = :client_id and ut.user_id = :user_id
+#           group by t.team_id,
+#           t.uid,
+#           t.client_team_id,
+#           t.team_name
+#         """).bindparams(client_id=client_id, user_id=user_id)
+                            
+#         result = await db.execute(smtp)
+#         rows = result.mappings().all()
+#         print(type(rows))
+#         arvore = [dict(row) for row in rows]
+#         return arvore
+        
+#     except Exception as e:
+#         logger.error(f"Erro ao conectar no banco: {e}")
+#         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
 
 @app.get("/resourcestree")
 async def getResourcesTree(
     db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    user_id = current_user["userId"]
-    client_id = current_user["clientId"]
+    userId = current_user["userId"]
+    clientId = current_user["clientId"]
 
     try:
         # Tenta executar uma query simples no banco
-        smtp = text("""
+        smtp = """
           with q1 as (
             select 
             client_id,
@@ -407,18 +1689,26 @@ async def getResourcesTree(
           t.uid AS team_uid,
           t.client_team_id,
           t.team_name,
-          jsonb_agg(to_jsonb(q1) ORDER BY q1.description) AS resources
+          list(q1 ORDER BY q1.description) AS resources
           from teams t
           join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
           join team_members tm on tm.client_id = t.client_id and  tm.team_id = t.team_id
           join q1 on q1.client_id = t.client_id and q1.resource_id = tm.resource_id
-          where ut.client_id = :client_id and ut.user_id = :user_id
+          where ut.client_id = $client_id and ut.user_id = $user_id
           group by t.team_id,
           t.uid,
           t.client_team_id,
           t.team_name
-        """).bindparams(client_id=client_id, user_id=user_id)
-                            
+        """
+        parametros = {
+            "client_id": clientId,
+            "user_id": userId
+        }
+        
+        res = dbd.execute(smtp,parametros).pl().to_dicts()
+        # print(res)
+        return res
+              
         result = await db.execute(smtp)
         rows = result.mappings().all()
         print(type(rows))
@@ -428,6 +1718,89 @@ async def getResourcesTree(
     except Exception as e:
         logger.error(f"Erro ao conectar no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
+
+# @app.get("/jobs")
+# async def getJobsResources(
+#     p_date: str = Query(..., description="Data no formato YYYY-MM-DD"),
+#     db: AsyncSession = Depends(database.get_db),
+#     current_user: dict = Depends(get_current_user)
+# ):
+    
+#     userId = current_user["userId"]
+#     userName = current_user["userName"]
+#     clientId = current_user["clientId"]
+
+    
+#     # for r in geoResult:
+#     #    print(r)
+#     try:
+#         # Tenta executar uma query simples no banco
+#         smtp = text("""
+#           select 
+#             'ORIGIN' as type,
+#             j.job_id,
+#             j.client_job_id,
+#             j.team_id, 
+#             j.resource_id, 
+#             r.client_resource_id,
+#             j.job_status_id, 
+#             js.description AS status_description,
+#             js.internal_code_status,
+#             js.style_id,
+#             j.job_type_id, 
+#             jt.description as type_description,
+#             j.address_id, 
+#             a.client_address_id, 
+#             a.geocode_lat, 
+#             a.geocode_long, 
+#             a.address, 
+#             a.city, 
+#             a.state_prov, 
+#             a.zippost, 
+#             a.time_setup,
+#             j.distance,
+#             j.time_distance,
+#             p.trade_name, 
+#             p.cnpj,
+#             j.time_setup, 
+#             j.time_service, 
+#             COALESCE(j.ajustment_start_date, j.plan_start_date) as plan_start_date, 
+#             COALESCE(j.ajustment_end_date,j.plan_end_date) as plan_end_date, 
+#             j.actual_start_date, 
+#             j.actual_end_date, 
+#             COALESCE(j.actual_start_date, j.ajustment_start_date, j.plan_start_date) as start_date,
+#             COALESCE(j.actual_end_date, j.ajustment_end_date, j.plan_end_date) as start_date,
+#             j.time_limit_start, 
+#             j.time_limit_end
+#             from jobs j
+#             join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
+#             join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+#             join teams t on t.client_id = j.client_id and t.team_id = j.team_id
+#             join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
+#             join address a on a.client_id = j.client_id and a.address_id = j.address_id
+#             join places p on p.client_id = j.client_id and p.place_id = j.place_id
+#             left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
+#             where ut.client_id = :client_id
+#               and ut.user_id = :user_id
+#               --and (js.internal_code_status <> 'CONCLU' OR js.internal_code_status IS NULL)
+#               and (
+#                     (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
+#                   or (
+#                     j.actual_start_date is not null AND (j.actual_start_date >= cast(:p_date as date) and j.actual_start_date < cast(:p_date as date) + interval '1 day')
+#                     )
+#                   )
+#             order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
+#         """).bindparams(client_id=clientId, user_id=userId, p_date=p_date)
+                            
+#         result = await db.execute(smtp)
+#         rows = result.mappings().all()
+
+#         res = [dict(row) for row in rows]
+#         return res
+        
+#     except Exception as e:
+#         logger.error(f"[getJobsResources] Erro ao conectar no banco: {e}")
+#         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
 
 @app.get("/jobs")
 async def getJobsResources(
@@ -445,7 +1818,7 @@ async def getJobsResources(
     #    print(r)
     try:
         # Tenta executar uma query simples no banco
-        smtp = text("""
+        smtp = """
           select 
             'ORIGIN' as type,
             j.job_id,
@@ -490,28 +1863,32 @@ async def getJobsResources(
             join address a on a.client_id = j.client_id and a.address_id = j.address_id
             join places p on p.client_id = j.client_id and p.place_id = j.place_id
             left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-            where ut.client_id = :client_id
-              and ut.user_id = :user_id
+            where j.client_id = $client_id
+              and ut.user_id = $user_id
               --and (js.internal_code_status <> 'CONCLU' OR js.internal_code_status IS NULL)
               and (
-                    (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
+                    (j.actual_start_date is null and j.plan_start_date >= cast($p_date as date) and j.plan_start_date < cast($p_date as date) + interval 1 day)
                   or (
-                    j.actual_start_date is not null AND (j.actual_start_date >= cast(:p_date as date) and j.actual_start_date < cast(:p_date as date) + interval '1 day')
+                    j.actual_start_date is not null AND (j.actual_start_date >= cast($p_date as date) and j.actual_start_date < cast($p_date as date) + interval 1 day)
                     )
                   )
             order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
-        """).bindparams(client_id=clientId, user_id=userId, p_date=p_date)
-                            
-        result = await db.execute(smtp)
-        rows = result.mappings().all()
+        """
 
-        res = [dict(row) for row in rows]
+        parametros = {
+            "client_id": clientId,
+            "p_date": p_date,
+            "user_id": userId
+        }
+        
+        res = dbd.execute(smtp,parametros).pl().to_dicts()
+        
         return res
         
     except Exception as e:
         logger.error(f"[getJobsResources] Erro ao conectar no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
-
+    
 @app.get("/openjobs")
 async def getOpenJobs(
     simulation_id: int,
@@ -2803,6 +4180,7 @@ async def getActualScheduleJobs(
 @app.post("/schedulejobs")
 async def scheduleJobs(
     body: schemas.ScheduleJobsRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(database.get_db),
 ):
@@ -2817,18 +4195,14 @@ async def scheduleJobs(
 
     async def calc_rote():
         if action =='C':
-            smtp = text(f"""
+            smtp = text("""
                 UPDATE simulation
                     SET json_dado = '[]'::jsonb
                 WHERE client_id = :client_id
                     AND simulation_id = :simulation_id
                     RETURNING json_dado
-                """).bindparams(client_id=clientId, simulation_id = simulationId)
-            parametros = {
-                "client_id": clientId,
-                "simulation_id": simulationId
-            }
-            result = await db.execute(smtp, parametros)
+                """)
+            result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
             await db.commit()
             for row in result:
                 logger.warning(f'Reports finalizados!')
@@ -2845,12 +4219,8 @@ async def scheduleJobs(
                 WHERE client_id = :client_id
                     AND simulation_id = :simulation_id
                     RETURNING json_dado
-                """).bindparams(client_id=clientId, simulation_id = simulationId)
-            parametros = {
-                "client_id": clientId,
-                "simulation_id": simulationId
-            }
-            result = await db.execute(smtp, parametros)
+                """)
+            result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
             await db.commit()
             for row in result:
                 logger.warning(f'Reports finalizados!')
@@ -2993,55 +4363,45 @@ async def scheduleJobs(
                 'jobs', (SELECT array_jobs FROM jobs_json),
                 'list', (SELECT job_id_list FROM list)
             ) AS vroom_payload;
-        """).bindparams(client_id=clientId, simulation_id = simulationId)
-        result = await db.execute(smtp)
-        subRows = result.mappings().all()
-        if not subRows or len(subRows) == 0:
+        """)
+        result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
+        subRow = result.mappings().first()
+        if not subRow:
             return
-        await logs(clientId=clientId,log='dados para vroom',logJson=dict(subRows[0]))
-        vroom_payload = subRows[0]['vroom_payload']
+        background_tasks.add_task(logs, clientId=clientId, log='dados para vroom', logJson=dict(subRow))
+        vroom_payload = subRow['vroom_payload']
 
         vroomJobList = vroom_payload.pop('list', 'Chave não encontrada')
         logger.info(list(vroomJobList))
         logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
         retorno = await optimize_routes_vroom(vroom_payload)
-                        
+        logger.info('terminou vroomm....')              
         routes = retorno['routes']
-        for rou in routes:
-            # print(rou)
-            # print('--------------------------------------')
-            steps = rou['steps']
-            geo = []
-            for step in steps:
-                geo.append([step['location'][0],step['location'][1]])
-            # print(geo)
-            # print('---------------------------------------')
-            await logs(clientId=clientId,log='montagem do geo',logJson=geo)
-            geoResult = await get_route_distance_block(geo)
-            await logs(clientId=clientId,log='retorno do geo',logJson=geoResult)
-            # print(geoResult) if r=='BRAC' else None
-            ln = 1
-            step = rou['steps'][0]
-            step['time_distance'] = 0
-            step['distance'] = 0
-            for x in geoResult:
-                # print(x['duration'],x['distance'])
-                step = rou['steps'][ln]
-                step['time_distance'] = x['duration']
-                step['distance'] = x['distance']
-                # print(ln,' - ',step)
-                ln += 1
+        geo_lists = [
+            [[s['location'][0], s['location'][1]] for s in rou['steps']]
+            for rou in routes
+        ]
+        logger.info('terminou geolist....')              
+        osrm_results = await asyncio.gather(
+            *[get_route_distance_block(geo) for geo in geo_lists]
+        )
+        for rou, geoResult in zip(routes, osrm_results):
+            rou['steps'][0]['time_distance'] = 0
+            rou['steps'][0]['distance'] = 0
+            for ln, x in enumerate(geoResult, start=1):
+                rou['steps'][ln]['time_distance'] = x['duration']
+                rou['steps'][ln]['distance'] = x['distance']
         listIds = [item['id'] for item in retorno.get("unassigned", [])]
         if listIds:
-            await logs(clientId=clientId,log='lista de unassigned',logJson=listIds)
+            background_tasks.add_task(logs, clientId=clientId, log='lista de unassigned', logJson=listIds)
             logger.debug(f'Lista de jobs excluidas da rota... {listIds}')
-        
-        await logs(clientId=clientId,log='retorno do vroom',logJson=retorno)
-        
+
+        background_tasks.add_task(logs, clientId=clientId, log='retorno do vroom', logJson=retorno)
+        logger.info('Terminou retorno ....')              
         vroomResult = json.dumps(retorno)
         smtp = text(f"""
             WITH payload_data AS (
-                SELECT '{vroomResult}'::jsonb AS data
+                SELECT CAST(:vroom_data AS jsonb) AS data
             ),
             rotas AS (
                 SELECT 
@@ -3170,8 +4530,8 @@ async def scheduleJobs(
                     end AS time_distance
                     --q.time_distance
                 from q1 q
-                join dados_jobs j ON j.client_id = 1 and j.new_job_id = q.job_id
-                join resources r ON r.client_id = 1 and r.resource_id = q.resource_id
+                join dados_jobs j ON j.client_id = :client_id and j.new_job_id = q.job_id
+                join resources r ON r.client_id = :client_id and r.resource_id = q.resource_id
                 join q1 q_1 on q_1.resource_id = q.resource_id and q_1.stop_type = 'start'
                 join q1 q_2 on q_2.resource_id = q.resource_id and q_2.stop_type = 'end'
                 join q1 q_3 on q_3.resource_id = q.resource_id and q_3.stop_type = 'job' AND q_3.sequence = 2
@@ -3263,14 +4623,18 @@ async def scheduleJobs(
                     )
                 ) AS res
             from grp
-        """).bindparams(client_id=clientId,simulation_id = simulationId)
-        result = await db.execute(smtp)
-        subSubRows = result.mappings().all()
-        if not subSubRows or len(subSubRows) == 0:
+        """)
+        result = await db.execute(smtp, {
+            "client_id": clientId,
+            "simulation_id": simulationId,
+            "vroom_data": vroomResult,
+        })
+        subSubRow = result.mappings().first()
+        if not subSubRow:
             return
-        
-        await logs(clientId=clientId,log=f'Resultado da Simulacao',logJson=subSubRows[0])
-        res = subSubRows[0]['res']
+
+        background_tasks.add_task(logs, clientId=clientId, log='Resultado da Simulacao', logJson=dict(subSubRow))
+        res = subSubRow['res']
 
         rep_json = json.dumps(res)
         if len(resources) == 1:
