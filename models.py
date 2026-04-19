@@ -298,7 +298,6 @@ class JobStatus(Base):
             Index('idx_job_status_00', 'client_job_status_id','client_id'),
             Index('idx_job_status_01', 'modified_date','client_id')
         )
-
 class JobType(Base):
     __tablename__ = "job_types"
 
@@ -412,14 +411,13 @@ class Jobs(Base):
             Index('idx_jobs_start_date', text('COALESCE(actual_start_date, plan_start_date)')),
             Index('idx_jobs_performance_composite', 'client_id', 'team_id', 'job_status_id')
     )
-
 class Reports(Base):
     __tablename__ = "reports"
 
     uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
     client_id = Column(Integer, primary_key=True, nullable=False)
     report_id = Column(Integer, primary_key=True, autoincrement=True)
-    team_id = Column(Integer, nullable=False)
+    client_team_id = Column(String(32), nullable=False)
     report_date = Column(Date, nullable=False)
     report = Column(JSONB, nullable=True)
     rebuild = Column(Integer, nullable=False, server_default=text("0"))
@@ -428,13 +426,8 @@ class Reports(Base):
     modified_by = Column(String(32), nullable=False)
     modified_date = Column(DateTime, nullable=False)
     __table_args__ = (
-            ForeignKeyConstraint(
-                ['client_id', 'team_id'],
-                ['teams.client_id', 'teams.team_id'],
-                name='fk_reports_teams'
-            ),
-            UniqueConstraint('client_id','team_id', 'report_date', name='uk_reports'),
-            Index('idx_reports_client_rebuild', 'client_id', 'rebuild','team_id', 'report_date')
+            UniqueConstraint('client_id','client_team_id', 'report_date', name='uk_reports'),
+            Index('idx_reports_client_rebuild', 'client_id', 'rebuild','client_team_id', 'report_date')
         )    
 class Simulation(Base):
     __tablename__ = "simulation"
@@ -481,3 +474,22 @@ class Logs(Base):
     log = Column(Text, nullable=True)
     log_json = Column(JSONB, nullable=True)
     created_by = Column(String(32), nullable=False)
+class DataLog(Base):
+    __tablename__ = "data_log"
+
+    client_id = Column(Integer, ForeignKey("clients.client_id"), nullable=False)
+    log_id = Column(Integer, primary_key=True, autoincrement=True)
+    log_date = Column(DateTime, nullable=False)
+    log_type = Column(String(64), nullable=False)
+    log_json = Column(JSONB, nullable=True)
+    __table_args__ = (
+      UniqueConstraint('client_id','log_type', name='uk_data_log'),  
+    )
+
+class ScheduleProcess(Base):
+    __tablename__ = "schedule_process"
+
+    client_id = Column(Integer, ForeignKey("clients.client_id"), nullable=False)
+    schedule_id = Column(Integer, primary_key=True, autoincrement=True)
+    process = Column(String(64), nullable=False)
+    schedule_time = Column(Time, nullable=False)

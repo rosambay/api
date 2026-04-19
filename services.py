@@ -5,6 +5,7 @@ from loguru import logger
 from config import settings
 from database import SessionLocal
 from sqlalchemy import text, update, delete, exists
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 import models, schemas
 import json
 from collections.abc import Mapping
@@ -176,4 +177,40 @@ async def logs(clientId: int, log: str, userId: int = None, logJson: dict | str 
             created_by = autor
         )
         db.add(newSimulation)
+        await db.commit()
+
+
+async def dataLog(clientId: int, logType: str, logJson: dict | str | list | None = None):
+    # --- O PORTEIRO ---
+    if isinstance(logJson, str):
+        # 1. Se for texto puro, converte pra objetos Python
+        dado_limpo = json.loads(logJson)
+        
+    elif isinstance(logJson, Mapping):
+        # Chegou Dicionário ou RowMapping do SQLAlchemy:
+        dict_bruto = dict(logJson)
+        
+        # A MÁGICA AQUI: "Lava" o dicionário para remover objetos datetime
+        # Transforma em string (resolvendo as datas) e volta para dict
+        json_string = json.dumps(dict_bruto, default=serializador_customizado)
+        dado_limpo = json.loads(json_string)
+        
+    else:
+        # 3. Se for uma lista pura ou None, passa direto
+        dado_limpo = logJson
+    # ------------------
+   
+    log_date = date.today()
+
+    async with SessionLocal() as db:
+        stmt = pg_insert(models.DataLog).values(
+            client_id=clientId,
+            log_date=log_date,
+            log_type=logType,
+            log_json=dado_limpo,
+        ).on_conflict_do_update(
+            constraint='uk_data_log',
+            set_=dict(log_json=dado_limpo, log_date=log_date),
+        )
+        await db.execute(stmt)
         await db.commit()

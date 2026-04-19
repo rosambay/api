@@ -1,14 +1,20 @@
+import sys
+import traceback
 import uuid
 import asyncio
 import redis.asyncio as Redis
+from process import buildReports
 import database
+import inspect
 import redis_client
 import json
 from datetime import date, datetime
 import models, schemas
+from duck_tables import create_tables
 from auth import verify_password, create_access_token
-from database import get_db, SessionLocal
+from database import get_db, SessionLocal, engine, Base
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text, update, delete, exists
 from sqlalchemy.future import select 
 from fastapi import FastAPI, Depends, HTTPException, status, Response, Request, Query, Form, BackgroundTasks
@@ -20,7 +26,7 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from config import settings
 from loguru import logger
-from services import optimize_routes_vroom, get_route_distance_block, logs
+from services import optimize_routes_vroom, get_route_distance_block, logs, dataLog, geocode_mapbox
 from contextlib import asynccontextmanager
 import duckdb
 import polars as pl
@@ -36,51 +42,385 @@ from schedulejobs_duckdb import router as duckdb_router
 dbd = duckdb.connect(':memory:')
 rd = redis_client.get_redis()
 
-async def cleanSessionsRedis(r: Redis, session_web_id: str):
-    # await r.delete(f"session:{session_web_id}")
-    # await r.delete(f"filter:{session_web_id}")
-    # await dropUserSession(session_web_id)
-    return True
 
 def oneHour(dateTime: str):
     data_obj = datetime.strptime(dateTime, '%Y-%m-%d %H:%M:%S')
     nova_data_obj = data_obj - timedelta(hours=1)
     return nova_data_obj.strftime('%Y-%m-%d %H:%M:%S')
 
+def log_error(e: Exception, msg: str = "Erro"):
+    tb = traceback.extract_tb(sys.exc_info()[2])
+    if tb:
+        d = tb[-1]
+        logger.error(f"{msg}: {e} — {d.filename}, linha {d.lineno}, função {d.name}")
+    else:
+        logger.error(f"{msg}: {e}")
+
+async def calcDistance():
+    try:
+        logger.warning("[calcDistance] Entrou no processo de cálculo de distância ...")
+    #vamos verificar se existe alguma tarefa concluida sem distância calculada
+        stmt = """
+            WITH q1 AS (
+                SELECT 
+                    j.client_id,
+                    j.team_id,
+                    j.resource_id,
+                    j.actual_start_date,
+                    j.plan_start_date,
+                    DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date)) AS fix_start_date,
+                    CASE 
+                        WHEN j.actual_start_date IS NOT NULL AND j.actual_end_date IS NOT NULL
+                            THEN CAST(EXTRACT(EPOCH FROM (j.actual_end_date - j.actual_start_date)) AS INTEGER)
+                        ELSE
+                            CAST(EXTRACT(EPOCH FROM (j.plan_end_date - j.plan_start_date)) AS INTEGER)
+                    END AS duration,
+                    a.geocode_long,
+                    a.geocode_lat,
+                    -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de chegada
+                    CASE 
+                        WHEN r.geocode_lat_at IS NULL 
+                        THEN FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
+                        ELSE r.geocode_lat_at 
+                    END AS geocode_lat_at,
+                    CASE 
+                        WHEN r.geocode_long_at IS NULL 
+                        THEN FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
+                        ELSE r.geocode_long_at 
+                    END AS geocode_long_at,
+                    -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de partida
+                    CASE 
+                        WHEN r.geocode_lat_from IS NULL 
+                        THEN FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
+                        ELSE r.geocode_lat_from 
+                    END AS geocode_lat_from,
+                    CASE 
+                        WHEN r.geocode_long_from IS NULL 
+                        THEN FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
+                        ELSE r.geocode_long_from 
+                    END AS geocode_long_from,
+                    -- verifica se existe algum distance nulo no periodo, então processa
+                    bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date))) AS null_distance,
+                    -- verifica se existe algum geocode está vazio e não processa
+                    bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date))) AS null_geo
+                FROM jobs j
+                JOIN address a 
+                    ON a.client_id = j.client_id AND a.address_id = j.address_id
+                JOIN job_status js 
+                    ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+                JOIN teams t 
+                    ON t.client_id = j.client_id AND t.team_id = j.team_id
+                JOIN resources r 
+                    ON r.client_id = j.client_id AND r.resource_id = j.resource_id
+                WHERE js.internal_code_status = 'CONCLU'
+                AND j.client_id = $client_id
+                ORDER BY j.client_id, j.team_id, j.resource_id, j.actual_start_date NULLS LAST, j.plan_start_date
+            )
+            SELECT
+                q1.client_id,
+                q1.team_id,
+                q1.resource_id,
+                q1.fix_start_date,
+                -- No DuckDB, manipulamos Listas Nativas primeiro e depois as convertemos para JSON
+                to_json(
+                    [ [MAX(q1.geocode_long_from)::NUMERIC, MAX(q1.geocode_lat_from)::NUMERIC] ] 
+                    || 
+                    list([q1.geocode_long::NUMERIC, q1.geocode_lat::NUMERIC] ORDER BY q1.actual_start_date NULLS LAST, q1.plan_start_date) 
+                    || 
+                    [ [MAX(q1.geocode_long_at)::NUMERIC, MAX(q1.geocode_lat_at)::NUMERIC] ]
+                ) AS rota_completa
+            FROM q1
+            WHERE null_distance = true
+            AND null_geo = false
+            GROUP BY q1.client_id, q1.team_id, q1.resource_id, q1.fix_start_date
+            ORDER BY q1.client_id, q1.team_id, q1.resource_id, q1.fix_start_date;
+        """
+        result = dbd.execute(stmt, {"client_id": 1}).pl().to_dicts()
+
+        if not result or len(result) == 0:
+            return
+
+        # Prepara dados de cada rota
+        rows_data = []
+        for row in result:
+            geo = row["rota_completa"]
+            if isinstance(geo, str):
+                geo = json.loads(geo)
+            rows_data.append({
+                "resource_id": row["resource_id"],
+                "team_id":     row["team_id"],
+                "fix_start_date": row["fix_start_date"],
+                "geo": geo
+            })
+
+        # Chama a API de rotas em paralelo, máximo 5 simultâneas
+        sem = asyncio.Semaphore(30)
+
+        async def fetch_route(row_data):
+            async with sem:
+                geo_result = await get_route_distance_block(row_data["geo"])
+                return {**row_data, "geo_result": geo_result}
+
+        resolved = await asyncio.gather(*[fetch_route(r) for r in rows_data])
+
+        # Updates no DuckDB sequencialmente (lock de escrita único)
+        update_stmt = """
+            UPDATE jobs
+                SET
+                    distance = t.distance,
+                    time_distance = t.duration,
+                    first_distance = t.first_distance,
+                    first_time_distance = t.first_duration,
+                    last_distance = t.last_distance,
+                    last_time_distance = t.last_duration
+                FROM (
+                    WITH qjson AS (
+                        SELECT
+                            y.*,
+                            FIRST_VALUE(distance) OVER (ORDER BY linha ASC) AS first_distance,
+                            FIRST_VALUE(distance) OVER (ORDER BY linha DESC) AS last_distance,
+                            FIRST_VALUE(duration) OVER (ORDER BY linha ASC) AS first_duration,
+                            FIRST_VALUE(duration) OVER (ORDER BY linha DESC) AS last_duration
+                        FROM (
+                            SELECT
+                                ROW_NUMBER() OVER() AS linha,
+                                CAST(value->>'duration' AS NUMERIC) AS duration,
+                                CAST(value->>'distance' AS NUMERIC) AS distance
+                            FROM (
+                                SELECT unnest(from_json($geo_json, '["JSON"]')) AS value
+                            )
+                        ) y
+                        ORDER BY linha ASC
+                    ),
+                    q1 AS (
+                        SELECT
+                            ROW_NUMBER() OVER() AS linha,
+                            j.*
+                        FROM (
+                            SELECT
+                                j.client_id,
+                                j.job_id,
+                                a.geocode_lat,
+                                a.geocode_long,
+                                j.actual_start_date,
+                                bool_or(j.distance IS NULL) OVER (
+                                    PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date))
+                                ) AS null_distance,
+                                bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (
+                                    PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date))
+                                ) AS null_geo
+                            FROM jobs j
+                            JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
+                            JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
+                            JOIN resources r ON r.client_id = j.client_id AND r.resource_id = j.resource_id
+                            WHERE COALESCE(j.actual_start_date, j.plan_start_date) >= $p_date
+                            AND COALESCE(j.actual_start_date, j.plan_start_date) < $p_date + INTERVAL '1 day'
+                            AND js.internal_code_status = 'CONCLU'
+                            AND j.client_id = $client_id
+                            AND j.team_id = $team_id
+                            AND j.resource_id = $resource_id
+                            ORDER BY j.actual_start_date NULLS LAST, j.plan_start_date
+                        ) j
+                    ),
+                    qjob AS (
+                        SELECT * FROM q1
+                        WHERE null_distance = true
+                        AND null_geo = false
+                    )
+                    SELECT
+                        b.client_id,
+                        b.job_id,
+                        a.distance,
+                        a.duration,
+                        a.last_distance,
+                        a.last_duration,
+                        a.first_distance,
+                        a.first_duration
+                    FROM qjson a
+                    JOIN qjob b ON b.linha = a.linha
+                ) AS t
+                WHERE jobs.client_id = t.client_id AND jobs.job_id = t.job_id
+            RETURNING *;
+        """
+
+        for item in resolved:
+            if not item["geo_result"]:
+                continue
+            dbd.execute(update_stmt, {
+                "client_id":   1,
+                "team_id":     item["team_id"],
+                "p_date":      item["fix_start_date"],
+                "resource_id": item["resource_id"],
+                "geo_json":    json.dumps(item["geo_result"]),
+            })
+
+        asyncio.create_task(commitOnDb(clientId=1, table='jobs'))
+
+            
+    except Exception as e:
+        log_error(e, "[calcDistance] Erro ao processar duckdb")
+
+async def checkPendencias():
+    try:
+        stmt = """
+            select distinct 
+                a.state_prov, a.city, a.address
+            from address a
+                join jobs j on j.address_id = a.address_id
+            where a.geocode_lat = 0  
+                OR a.geocode_long = 0
+                OR a.geocode_lat < -40 
+                OR a.geocode_lat > 10
+                OR a.geocode_long < -80 
+                OR a.geocode_long > -30
+                OR a.geocode_lat is null
+                OR a.geocode_long is null
+                order by a.state_prov, a.city, a.address   
+        """
+        result = dbd.execute(stmt).pl().to_dicts()
+        
+        for row in result:
+            address = f'{row["address"]}, {row["city"]}, {row["state_prov"]}'
+            print(f"Pendência encontrada para o endereço: {address}. Iniciando processo de geocodificação...")
+            retorno = await geocode_mapbox(address)
+            geocode_long = retorno["longitude"]
+            geocode_lat = retorno["latitude"]
+            smtp = """
+                update address
+                    set geocode_long = $geocode_long
+                        ,geocode_lat = $geocode_lat
+                    where state_prov = $state_prov
+                    and city = $city
+                    and address = $address
+            """
+            dbd.execute(smtp,{"city": row["city"], "state_prov": row["state_prov"], "address": row["address"], "geocode_long": geocode_long, "geocode_lat": geocode_lat})
+        
+        if result and len(result) > 0:
+            asyncio.create_task(commitOnDb(clientId=1, table='address'))
+
+    except Exception as e:
+        log_error(e)
+
+async def commitOnDb(clientId: int, table: str):
+    try:
+        result = dbd.execute(f"""
+            SELECT to_json(list(t)) 
+                FROM (select * from {table}) AS t
+                            """).fetchone()[0]
+        # asyncio.create_task(rd.set(f"{table}:client_id:{clientId}",result))
+        asyncio.create_task(dataLog(clientId=clientId, logType=table, logJson=result))
+    except Exception as e:
+        log_error(e, "Erro ao commitar no banco")
+
 async def getBackup():
-    ## resources
-    configuracoes = [
-        ('styles', 'style_id'),
-        ('resources', 'resource_id'),
-        ('resource_windows', 'rw_id'),
-        ('teams', 'team_id'),
-        ('team_members', 'team_id'),
-        ('job_types', 'job_type_id'),
-        ('job_status', 'job_status_id'),
-        ('places', 'place_id'),
-        ('address', 'address_id'),
-        ('jobs', 'job_id')
-    ]
-    for table,field in configuracoes:
-        isEmpty = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM {table})").fetchone()[0]
-        if isEmpty:
-            recover = await rd.get(f"{table}:client_id:1")
-            if recover:
-                dados_dict = json.loads(recover)
-                df_data = pl.DataFrame(dados_dict)
-                if not table == 'team_members':
-                    vId, modifiedDate = dbd.execute(f"SELECT COALESCE(MAX({field}),0) + 1, MAX(modified_date) FROM df_data").fetchone()
-                    if modifiedDate:
-                        dbd.execute(F"""
-                            UPDATE snap_time
-                            SET {table} = CAST($p_date AS TIMESTAMP)
-                        """,{"p_date":modifiedDate})
-                        print('A ultima data é ', modifiedDate[:19])
-                    dbd.execute(f"CREATE OR REPLACE SEQUENCE seq_{field} START {int(vId)}")
-                stmt = f"INSERT INTO {table} (SELECT * FROM df_data)"
-                dbd.execute(stmt)
-                result = dbd.execute(f"select count(*) AS Total from {table}").pl().to_dicts()
-                print("Já existe...", result)
+    try:
+
+        # JOGA EM MEMÓRIA TODAS OS DADOS DE TABELAS QUE PRECISAM DE ALGUM TIPO DE DEPARA PARA O FUNCIONAMENTO DO SISTEMA, PARA EVITAR PROBLEMAS DE FALHA DE CONEXÃO OU TEMPO DE RESPOSTA LENTO DO BANCO DE DADOS PRINCIPAL
+        client_ids = []
+        async with SessionLocal() as db:
+            #buscar os clientes
+            clients = await db.execute(text("SELECT client_id FROM clients"))
+            client_ids = [row[0] for row in clients.fetchall()]
+
+            for client_id in client_ids:
+                #verifica se existe o snap_time para cada cliente, se não existir, criar um registro com data antiga para forçar a atualização de todas as tabelas
+                isEmpty = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM snap_time WHERE client_id = $client_id)", {"client_id": client_id}).fetchone()[0]
+                if isEmpty:
+                    stmt = """
+                        INSERT INTO snap_time SELECT
+                            $client_id,
+                            CURRENT_DATE - INTERVAL 5 DAY AS jobs,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS styles,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS resources,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS resource_windows,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS teams,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS job_types,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS job_status,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS places,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS address,
+                            CURRENT_DATE - INTERVAL (365*2) DAY AS geopos;
+                    """
+                    result = dbd.execute(stmt, {"client_id": client_id})
+                    
+
+                # # Atualiza tabelas fixas
+                # isEmpty = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM job_status where client_id = $client_id)", {"client_id": client_id}).fetchone()[0]
+                # if isEmpty:
+                #     stmt = text("""
+                #         select jsonb_agg(to_jsonb(js) order by client_id, job_status_id) json_data
+                #         from job_status js
+                #         where client_id = :client_id
+                #     """)
+                #     result = await db.execute(stmt, {"client_id": client_id})
+                #     for row in result:
+                #         # df_data = pl.from_dicts(row.json_data, infer_schema_length=None)
+                #         df_data = pl.DataFrame(row.json_data)
+                #         stmt = "INSERT OR IGNORE INTO job_status (SELECT uid, client_id, job_status_id, client_job_status_id, style_id, description, internal_code_status, created_by, created_date, modified_by, modified_date FROM df_data) returning *"
+                #         result = dbd.execute(stmt).pl().to_dicts()
+                #         if result:  
+                #             asyncio.create_task(commitOnDb(clientId=client_id, table='job_status'))
+                #             # for row in result:
+                #             #     print(row)
+
+                #         result = dbd.execute(f"select count(*) AS Total from job_status").pl().to_dicts()
+                #         print("[job_status] Total de linhas... ", result)
+                #         vId, modifiedDate = dbd.execute(f"SELECT COALESCE(MAX(job_status_id),0) + 1, MAX(modified_date) FROM df_data").fetchone()
+                #         if modifiedDate:
+                #             dbd.execute(F"""
+                #                 UPDATE snap_time
+                #                 SET job_status = CAST($p_date AS TIMESTAMP)
+                #             """,{"p_date":modifiedDate})
+                #             print('A ultima data é ', modifiedDate[:19])
+                #         dbd.execute(f"CREATE OR REPLACE SEQUENCE seq_job_status_id START {int(vId)}")
+        
+            configuracoes = [
+                ('styles', 'style_id'),
+                ('resources', 'resource_id'),
+                ('resource_windows', 'rw_id'),
+                ('teams', 'team_id'),
+                ('team_members', 'team_id'),
+                ('job_types', 'job_type_id'),
+                ('job_status', 'job_status_id'),
+                ('places', 'place_id'),
+                ('address', 'address_id'),
+                ('jobs', 'job_id')
+            ]
+            for client_id in client_ids:
+                for table,field in configuracoes:
+                    lista_colunas = dbd.execute(f"""
+                        SELECT string_agg(name,', ' ORDER BY cid ASC)
+                        FROM pragma_table_info('{table}') 
+                    """).fetchone()[0]
+
+                    print(f"Verificando tabela {table} do cliente {client_id} ...")
+                    isEmpty = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM {table})").fetchone()[0]
+                    if isEmpty:
+                        stmt = text("""
+                            select log_json AS json_data
+                            FROM data_log
+                            where log_type = :log_type 
+                                AND client_id = :client_id
+                        """)
+                        result = await db.execute(stmt, {"log_type": table, "client_id": client_id})
+                        rows = result.mappings().all()
+                        for row in rows:
+                            # df_data = pl.from_dicts(row.json_data, infer_schema_length=None)
+                            df_data = pl.DataFrame(row.json_data, infer_schema_length=None)
+                            if not table == 'team_members':
+                                vId, modifiedDate = dbd.execute(f"SELECT COALESCE(MAX({field}),0) + 1, MAX(modified_date) FROM df_data").fetchone()
+                                if modifiedDate:
+                                    dbd.execute(F"""
+                                        UPDATE snap_time
+                                        SET {table} = CAST($p_date AS TIMESTAMP)
+                                    """,{"p_date":modifiedDate})
+                                    print('A ultima data é ', modifiedDate[:19])
+                                dbd.execute(f"CREATE OR REPLACE SEQUENCE seq_{field} START {int(vId)}")
+                            stmt = f"INSERT INTO {table} ({lista_colunas}) SELECT {lista_colunas} FROM df_data"
+                            dbd.execute(stmt)
+                            result = dbd.execute(f"select count(*) AS Total from {table}").pl().to_dicts()
+                            print(f"[Tabela {table}] Total de linhas restauradas ... ", result)
+    except Exception as e:
+        log_error(e)
 
 async def getResources():
     logger.warning("[getResources] Entrou atualização dos Recursos ...")
@@ -127,14 +467,10 @@ async def getResources():
                 """
             parametros = {"client_id": 1}     
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
-            if rows:   
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from resources) AS t
-                                    """).fetchone()[0]
-                await rd.set("resources:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+            if rows:  
+                asyncio.create_task(commitOnDb(clientId=1, table='resources'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             dbd.execute("""
                 update snap_time
@@ -142,7 +478,7 @@ async def getResources():
 
 
         except Exception as e:
-            logger.error(f"[getResource] Erro ao processar postgres: {e}")
+            log_error(e, "[getResource] Erro ao processar duckdb")
 
     return
 
@@ -174,9 +510,9 @@ async def getAddress():
                               OR u.state_prov IS DISTINCT FROM t.state_prov
                               OR u.zippost IS DISTINCT FROM t.zippost
                               )  THEN
-                      UPDATE SET geocode_lat = t.geocode_lat
+                      UPDATE SET geocode_lat = COALESCE(CAST(t.geocode_lat AS DOUBLE),u.geocode_lat)
                           ,address = t.address
-                          ,geocode_long = t.geocode_long
+                          ,geocode_long = COALESCE(CAST(t.geocode_long AS DOUBLE),u.geocode_long)
                           ,city = t.city
                           ,state_prov = t.state_prov
                           ,zippost = t.zippost
@@ -186,14 +522,10 @@ async def getAddress():
                 """
             parametros = {"client_id": 1}     
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
-            if rows:   
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from address) AS t
-                                    """).fetchone()[0]
-                await rd.set("address:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+            if rows: 
+                asyncio.create_task(commitOnDb(clientId=1, table='address'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             dbd.execute("""
                 update snap_time
@@ -201,7 +533,7 @@ async def getAddress():
 
 
         except Exception as e:
-                logger.error(f"[getAddress] Erro ao processar postgres: {e}")
+                log_error(e, "[getAddress] Erro ao processar duckdb")
 
     return
 
@@ -237,22 +569,18 @@ async def getPlaces():
               """
             parametros = {"client_id": 1}     
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
-            if rows:   
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from places) AS t
-                                    """).fetchone()[0]
-                await rd.set("places:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+            if rows:
+                asyncio.create_task(commitOnDb(clientId=1, table='places'))    
+                # for row in rows:
+                #     print(row["merge_action"])
 
             dbd.execute("""
                 update snap_time
-                    SET address = $dt""",{"dt": last_snap})
+                    SET places = $dt""",{"dt": last_snap})
             
 
         except Exception as e:
-                logger.error(f"[getPlaces] Erro ao processar postgres: {e}")
+                log_error(e, "[getPlaces] Erro ao processar duckdb")
 
     return
 
@@ -291,23 +619,18 @@ async def getGeoPos():
             parametros = {"client_id": 1}     
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             if rows:   
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from resources) AS t
-                                    """).fetchone()[0]
-                await rd.set("resources:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='resources'))   
+                # for row in rows:
+                #     print(row["merge_action"])
 
             dbd.execute("""
                 update snap_time
                     SET geopos = $dt""",{"dt": last_snap})
             
         except Exception as e:
-                logger.error(f"[getGeoPos] Erro ao processar postgres: {e}")
+                log_error(e, "[getGeoPos] Erro ao processar duckdb")
 
     return
-
 
 async def getResourceWindow():
     logger.warning("[getResourceWindow] Entrou atualização das Janelas de Recursos ...")
@@ -363,13 +686,9 @@ async def getResourceWindow():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from resource_windows) AS t
-                                    """).fetchone()[0]
-                await rd.set("resource_windows:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='resource_windows'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             result = dbd.execute("select count(*) as total from resource_windows").pl().to_dicts()
             print(result)
@@ -381,7 +700,7 @@ async def getResourceWindow():
 
 
         except Exception as e:
-                logger.error(f"[getResourceWindow] Erro ao processar postgres: {e}")
+                log_error(e, "[getResourceWindow] Erro ao processar duckdb")
 
     return
 
@@ -398,9 +717,7 @@ async def getStyle():
     result_rows = await getStyleMetrix(dateTime, settings.client_uid)
     if result_rows:
         last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-        dbd.execute("""
-                update snap_time
-                    SET styles = $dt""",{"dt": last_snap})
+        
         try:
             def garantir_colunas(df: pl.DataFrame, colunas: list) -> pl.DataFrame:
                 for col in colunas:
@@ -445,18 +762,17 @@ async def getStyle():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from styles) AS t
-                                    """).fetchone()[0]
-                await rd.set("styles:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
-
+                asyncio.create_task(commitOnDb(clientId=1, table='styles'))
+                # for row in rows:
+                #     print(row["merge_action"])
+            dbd.execute("""
+                update snap_time
+                    SET styles = $dt""",{"dt": last_snap})
+            
             result = dbd.execute("select count(*) as total from styles").pl().to_dicts()
             print(result)
         except Exception as e:
-                    logger.error(f"Erro ao processar postgres: {e}")
+            log_error(e, "[getStyle] Erro ao processar duckdb")
     
 
     return
@@ -497,23 +813,155 @@ async def getTeamMember():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from team_members) AS t
-                                    """).fetchone()[0]
-                await rd.set("team_members:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='team_members'))
+                # for row in rows:
+                #     print(row["merge_action"])
+
             result = dbd.execute("select count(*) as total from team_members").pl().to_dicts()
             print(result)
         except Exception as e:
-                    logger.error(f"Erro ao processar postgres: {e}")
+            log_error(e, "[getTeamMember] Erro ao processar duckdb")
     
 
     return
 
+async def getJobType():
+    logger.warning("[getJobType] Entrou atualização de Tipos de Trabalho ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['job_types']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getJobTypeMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            dfDados = pl.DataFrame(result_rows)
+            stmt = """
+                MERGE INTO job_types AS u
+                USING (SELECT * FROM dfDados) AS t
+                ON u.client_id = $client_id AND u.client_job_type_id = t.code_value
+                WHEN MATCHED AND ( u.description IS DISTINCT FROM t.description )
+                        THEN
+                    UPDATE SET description = t.description
+                        ,modified_by = 'INTEGRATION'
+                        ,modified_date = t.modified_dttm
+                RETURNING merge_action, *;
+            """
+            parametros = {"client_id": 1}
+
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                asyncio.create_task(commitOnDb(clientId=1, table='job_types'))
+
+                # for row in rows:
+                #     print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET job_types = $dt""",{"dt": last_snap})
+
+            result = dbd.execute("select count(*) as total from job_types where client_id = $client_id", {"client_id": 1}).pl().to_dicts()
+            print("Total de job_types:", result)
+
+        except Exception as e:
+            log_error(e, "[getJobType] Erro ao processar duckdb")
+
+    return
+
+async def getJobStatus():
+    logger.warning("[getJobStatus] Entrou atualização de Status de Trabalho ...")
+
+    result = dbd.execute("select * from snap_time").pl().to_dicts()
+    gDate = result[0]['job_status']
+    dateTime = gDate.strftime('%Y-%m-%d %H:%M:%S')
+    print(dateTime)
+
+    dateTime = oneHour(dateTime)
+
+    result_rows = await getJobStatusMatrix(dateTime, settings.client_uid)
+
+    if result_rows:
+        last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
+        try:
+            dfDados = pl.DataFrame(result_rows)
+            stmt = """
+                MERGE INTO job_status AS u
+                USING (SELECT * FROM dfDados x
+                        JOIN styles s ON s.client_style_id = x.item_style_id AND s.client_id = $client_id
+                        ) AS t
+                ON u.client_id = $client_id AND u.client_job_status_id = t.task_status
+                WHEN MATCHED AND (
+                        u.description IS DISTINCT FROM t.description
+                        OR u.style_id IS DISTINCT FROM t.style_id)
+                        THEN
+                    UPDATE SET description = t.description
+                        ,style_id = t.style_id
+                        ,modified_by = 'INTEGRATION'
+                        ,modified_date = t.modified_dttm
+                RETURNING merge_action, *;
+            """
+            parametros = {"client_id": 1}
+
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            
+            if rows:
+                asyncio.create_task(commitOnDb(clientId=1, table='job_status'))
+                # for row in rows:
+                #     print(row["merge_action"])
+
+            dbd.execute("""
+                update snap_time
+                    SET job_status = $dt""",{"dt": last_snap})
+            
+            result = dbd.execute("select count(*) as total from job_status where client_id = $client_id", {"client_id": 1}).pl().to_dicts()
+            print("Total de job_status:", result)
+
+        except Exception as e:
+                log_error(e, "[getJobStatus] Erro ao processar duckdb")
+
+    return
+
+async def getPriority():
+    logger.warning("[getPriority] Entrou atualização das Janelas de Recursos ...")
+
+
+    result_rows = await getPriorityMatrix()
+    if result_rows:
+        try:
+            df_dados = pl.DataFrame(result_rows)
+            stmt = """
+                  MERGE INTO priority AS u
+                  USING (SELECT * FROM df_dados) AS t
+                  ON u.client_id = $client_id AND u.client_priority_id = t.contr_type
+                  WHEN MATCHED AND (
+                              u.priority IS DISTINCT FROM t.ranking
+                              )  THEN
+                      UPDATE SET 
+                          priority = t.ranking
+                          ,modified_by = 'INTEGRATION'
+                          ,modified_date = NOW()
+                  WHEN NOT MATCHED THEN
+                      INSERT (client_id, client_priority_id, priority, created_by, created_date, modified_by, modified_date)
+                      VALUES ($client_id, t.contr_type, t.ranking, 'INTEGRATION', NOW(), 'INTEGRATION', NOW())
+                  RETURNING merge_action, *;
+              """
+            parametros = {"client_id": 1}     
+            rows = dbd.execute(stmt,parametros).pl().to_dicts()
+            if rows: 
+                asyncio.create_task(commitOnDb(clientId=1, table='priority'))
+
+        except Exception as e:
+            log_error(e, "[getPriority] Erro ao processar duckdb")
+
+    return
+
 async def getJobs():
-    
     logger.warning("[getJobs] Entrou atualização das Tarefas ...")
 
     result = dbd.execute("select * from snap_time").pl().to_dicts()
@@ -527,13 +975,55 @@ async def getJobs():
 
     if result_rows:
         last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-        dbd.execute("""
-                update snap_time
-                    SET jobs = $dt""",{"dt": last_snap})
-      
-    #   first_snap = result_rows[0]['first_snap'][:19].replace('T', ' ')
         try:
-            df_jobs = pl.DataFrame(result_rows)
+            expected_fields = [
+                "request_id",
+                "contr_type",
+                "task_id", 
+                "team_id",
+                "desc_team",
+                "person_id",
+                "task_type",
+                "desc_task_type",
+                "task_status", 
+                "desc_task_status",
+                "item_style_id", 
+                "place_id",
+                "trade_name",
+                "cnpj",
+                "created_dttm", 
+                "modified_dttm",
+                "work_duration",
+                "plan_start_dttm",
+                "plan_end_dttm",
+                "plan_task_dur_min",
+                "actual_start_dttm",
+                "actual_end_dttm",
+                "sla",
+                "address_id",
+                "geocode_lat", 
+                "geocode_long",
+                "address",
+                "city",
+                "state_prov", 
+                "zippost",
+                "address_modified_dttm",
+                "team_modified_dttm",
+                "place_modified_dttm",
+                "task_type_modified_dttm",
+                "task_status_modified_dttm",
+                "resource_name",
+                "resource_geocode_lat", 
+                "resource_geocode_long", 
+                "geocode_lat_from",
+                "geocode_long_from", 
+                "geocode_lat_at", 
+                "geocode_long_at",
+                "work_status",
+                "resource_modified_dttm"
+            ]
+            normalized_rows = [{f: row.get(f, None) for f in expected_fields} for row in result_rows]
+            df_jobs = pl.DataFrame(normalized_rows)
             parametros = {"client_id": 1}
             
             # Resources create
@@ -562,13 +1052,9 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from resources) AS t
-                                    """).fetchone()[0]
-                await rd.set("resources:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                 asyncio.create_task(commitOnDb(clientId=1, table='resources'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             result = dbd.execute("select count(*) as total from resources").pl().to_dicts()
             print(result)
@@ -591,13 +1077,9 @@ async def getJobs():
                     """
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from teams) AS t
-                                    """).fetchone()[0]
-                await rd.set("teams:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='teams'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             result = dbd.execute("select count(*) as total from teams").pl().to_dicts()
             print(result)
@@ -620,13 +1102,12 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from job_types) AS t
-                                    """).fetchone()[0]
-                await rd.set("job_types:client_id:1",result)
+                asyncio.create_task(commitOnDb(clientId=1, table='job_types'))
+                # for row in rows:
+                #     print(row["merge_action"])
             result = dbd.execute("select count(*) as total from job_types").pl().to_dicts()
             print(result)
+
             # Job status create
             stmt = """
                 MERGE INTO job_status AS u
@@ -649,15 +1130,11 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from job_status) AS t
-                                    """).fetchone()[0]
-                await rd.set("job_status:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='job_status'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
-            result = dbd.execute("select count(*) as total from job_types").pl().to_dicts()
+            result = dbd.execute("select count(*) as total from job_status").pl().to_dicts()
             print(result)
             # Places create
             stmt = """
@@ -678,11 +1155,7 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from places) AS t
-                                    """).fetchone()[0]
-                await rd.set("places:client_id:1",result)
+                asyncio.create_task(commitOnDb(clientId=1, table='places'))
                 for row in rows:
                     print(row["merge_action"])
 
@@ -712,29 +1185,12 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from address) AS t
-                                    """).fetchone()[0]
-                await rd.set("address:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='address'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
             result = dbd.execute("select count(*) as total from address").pl().to_dicts()
             print(result)
-
-            #   sao_iguais = df_jobs.equals(df_jobs_old)
-            #   df_jobs_old = df_jobs
-            #   if sao_iguais:
-            #       logger.warning('São Iguais...')
-            
-            #   json_jobs = json.dumps(result_rows)
-
-            #   print(json_jobs)
-            #   result = dbd.execute("select * from df_jobs").pl().to_dicts()
-            #   print(result)
-            
-            
             #    #Criação e atualização do Job
             stmt = """
                 MERGE INTO jobs AS u
@@ -795,16 +1251,16 @@ async def getJobs():
             rows = dbd.execute(stmt,parametros).pl().to_dicts()
             
             if rows:
-                result = dbd.execute("""
-                    SELECT to_json(list(t)) 
-                        FROM (select * from jobs) AS t
-                                    """).fetchone()[0]
-                await rd.set("jobs:client_id:1",result)
-                for row in rows:
-                    print(row["merge_action"])
+                asyncio.create_task(commitOnDb(clientId=1, table='jobs'))
+                # for row in rows:
+                #     print(row["merge_action"])
 
+            dbd.execute("""
+                update snap_time
+                    SET jobs = $dt""",{"dt": last_snap})
+            
             result = dbd.execute("select count(*) as total from jobs").pl().to_dicts()
-            print(result)
+            print("Total de jobs:", result[0]["total"])
 
             dbd.execute("""
             CREATE TABLE IF NOT EXISTS user_team AS
@@ -813,43 +1269,24 @@ async def getJobs():
                     """)
 
             result  = dbd.execute("select * from user_team").pl().to_dicts()
-            print(result)
-            #   async with SessionLocal() as db:
-            #     result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-            #     await db.commit()
-            #     for row in result:
-            #         type = row.merge_action + ' ON JOB'
-            #         logger.info(f"ID: {row.job_id} | Ação JOB realizada: {row.merge_action}")
 
-            #   await r.set(snapKey, last_snap)
+            print(result)
+
         except Exception as e:
-                    logger.error(f"[getJobs] Erro ao processar postgres: {e}")
+            log_error(e, "[getJobs] Erro ao processar duckdb")
     return
 
 async def processo_em_background():
-    SLEEP_NORMAL = 10
+    SLEEP_NORMAL = 60
     SLEEP_MAX = 300
     consecutive_failures = 0
 
     try:
+        #executar antes de todos
+        await getBackup()
+        await getPriority()
         while True:
             try:
-                # await getStyle(r)
-                # await asyncio.sleep(0.5)
-                # await getPerson(r)
-                # await asyncio.sleep(0.5)
-                # await getAddress(r)
-                # await asyncio.sleep(0.5)
-                # await getGeoPos(r)
-                # await asyncio.sleep(0.5)
-                # await getLogInOut(r)
-                # await asyncio.sleep(0.5)
-                # await getTeamMember(r)
-                # await asyncio.sleep(0.5)
-                # await getTasksNoPerson(r)
-                # await asyncio.sleep(0.5)
-                await getBackup()
-                await asyncio.sleep(0.5)
                 await getStyle()
                 await asyncio.sleep(0.5)
                 await getJobs()
@@ -864,7 +1301,15 @@ async def processo_em_background():
                 await asyncio.sleep(0.5)
                 await getAddress()
                 await asyncio.sleep(0.5)
+                await checkPendencias()
+                await asyncio.sleep(0.5)
+                await calcDistance()
+                await asyncio.sleep(0.5)
                 await getPlaces()
+                await asyncio.sleep(0.5)
+                await getJobType()
+                await asyncio.sleep(0.5)
+                await getJobStatus()
 
                 if consecutive_failures > 0:
                     logger.info(f"Background task recuperada após {consecutive_failures} falha(s) consecutiva(s).")
@@ -880,334 +1325,108 @@ async def processo_em_background():
 
             logger.info(f'Aguardando {sleep_time}s para próximo refresh ...')
             await asyncio.sleep(sleep_time)
-            
-            # teve_alteracao = False
-
-            # if result_rows:
-            #     for chamado in result_rows:
-            #         data_str = chamado['c_plan_start_date'][:19].replace('T', ' ')
-            #         data_alvo = datetime.strptime(data_str, '%Y-%m-%d %H:%M:%S')
-            #         tmpDateTime = (datetime.now() - timedelta(days=30))
-            #         diferenca = data_alvo - tmpDateTime
-            #         TEMPO_EXPIRACAO_SEGUNDOS = int(diferenca.total_seconds())
-            #         if TEMPO_EXPIRACAO_SEGUNDOS < 0:
-            #             TEMPO_EXPIRACAO_SEGUNDOS = 0
-
-            #         chave_unica = f"chamado:{chamado['request_id']}:{chamado['task_id']}"
-                    
-            #         await r.set('snap_time', datetime.fromisoformat(chamado['last_snap'].replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S'))  # Atualiza o snap_time a cada execução
-                    
-            #         valor_json = json.dumps(chamado, sort_keys=True)
-                        
-            #         planStartDate = chamado.get('c_plan_start_date', '').split('T')[0]
-            #         chave_indice = f"idx:plan_start_date:{planStartDate}"
-
-            #         try:
-            #             resultado = await update_if_different(
-            #                 keys=[chave_unica, chave_indice], 
-            #                 args=[valor_json, TEMPO_EXPIRACAO_SEGUNDOS]
-            #             )
-                        
-            #             if resultado == 1:
-            #                 teve_alteracao = True
-            #                 await criar_e_enviar_notificacao(r, "chamado_alterado", "Chamado Alterado", dados_extra=chamado)
-            #             else:
-            #               await criar_e_enviar_notificacao(r, "chamado_alterado", "Chamado Alterado", dados_extra=chamado)  
-
-            #         except Exception as e:
-            #             logger.error(f"Erro ao processar {chave_unica}: {e}")
-
-            # if teve_alteracao:
-            #     logger.info("Alterações detectadas! Reconstruindo a árvore de cache...")
-                
-                # listKeys = await r.sunion("cache:arvore_times:*")
-                # for key in listKeys:
-                #     await atualizar_cache_arvore(r, key)
-                #     logger.info(f"Nova árvore salva no cache com sucesso! Chave: {key}")
-            
+           
     except asyncio.CancelledError:
         logger.info("Processo contínuo foi encerrado.")
 
+async def scheduled_process():
+    SLEEP_NORMAL = 60
+    SLEEP_MAX = 600
+    consecutive_failures = 0
+    client_ids = []
+    print("Iniciando processo agendado...")
+    try:
+        async with SessionLocal() as db:
+            
+            stmt = text("""
+                select jsonb_agg(to_jsonb(sp) order by client_id, schedule_id) json_data
+                from schedule_process sp
+            """)
+            result = await db.execute(stmt)
+            rows = result.mappings().all()
+            if rows[0]['json_data'] is not None:
+                df_data = pl.DataFrame(rows[0]['json_data'])
+                stmt = "CREATE TABLE IF NOT EXISTS schedule_process AS SELECT * FROM df_data"
+                dbd.execute(stmt)
+                print(stmt)
+            
+            stmt = text("""
+                with q1 as(
+                    select
+                        client_id, 
+                        client_team_id, 
+                        report_date, 
+                        rebuild 
+                    from reports
+                    )
+                    select jsonb_agg(to_jsonb(q1)) json_data
+                from q1
+            """)
+            result = await db.execute(stmt)
+            rows = result.mappings().all()
+            if rows[0]['json_data'] is not None:
+                print(rows[0]['json_data'])
+                df_data = pl.DataFrame(rows[0]['json_data'])
+                stmt = "INSERT INTO reports AS SELECT * FROM df_data"
+                dbd.execute(stmt)
+                print(stmt)
+
+        while True:
+            try:
+                await getBackup()
+                await asyncio.sleep(0.5)
+                await checkPendencias()
+                await asyncio.sleep(0.5)
+                print("Verificando agendamentos...")
+                clients = await db.execute(text("SELECT client_id FROM clients"))
+                client_ids = [row[0] for row in clients.fetchall()]
+                for clientId in client_ids:
+                    print(f"Verificando agendamento para o cliente {clientId}...")
+                    vTime = datetime.now().time().strftime("%H:%M:") + "00"
+                    isTime = dbd.execute("""SELECT EXISTS (SELECT 1 FROM schedule_process WHERE client_id = $client_id AND process = $process AND schedule_time = $time)""", {"client_id": clientId, "process": "buildReports", "time": vTime}).fetchone()[0]
+                    print(f"Agendamento para cliente {clientId} no horário {vTime}: {'Encontrado' if isTime else 'Não encontrado'}")
+                    if isTime:
+                        print(f"Agendamento encontrado para o cliente {clientId} no horário {vTime}. Iniciando processo de construção de relatórios...")
+                        asyncio.create_task(buildReports(clientId, dbd, db))
+                # await asyncio.sleep(10)
+
+                asyncio.create_task(buildReports(clientId, dbd, db))
+                # await asyncio.sleep(0.5)
+                # await asyncio.sleep(0.5)
+                # await getPriority(r)
+
+                if consecutive_failures > 0:
+                    logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
+                consecutive_failures = 0
+                sleep_time = SLEEP_NORMAL
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_failures += 1
+                sleep_time = min(SLEEP_NORMAL * (2 ** consecutive_failures), SLEEP_MAX)
+                logger.error(f"Erro na iteração do background job (falha #{consecutive_failures}): {e}. Próxima tentativa em {sleep_time}s.")
+
+            logger.warning(f'Aguardando {sleep_time}s para próximo refresh ...')
+            await asyncio.sleep(sleep_time)
+
+    except asyncio.CancelledError:
+        logger.info("Processo contínuo foi encerrado.")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # r = redis_client.get_redis()
     # await r.flushall()
-
-    dbd.execute("""
-        CREATE TABLE IF NOT EXISTS snap_time AS
-            SELECT CURRENT_DATE - INTERVAL 45 DAY AS jobs,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS styles,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS resources,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS resource_windows,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS teams,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS job_types,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS job_status,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS places,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS address,
-                CURRENT_DATE - INTERVAL (365*2) DAY AS geopos;
-        CREATE SEQUENCE IF NOT EXISTS seq_job_id;
-        CREATE TABLE IF NOT EXISTS jobs (
-            uid                     UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_id               INTEGER NOT NULL,
-            job_id                  INTEGER NOT NULL,
-            client_job_id           VARCHAR NOT NULL,
-            team_id                 INTEGER NULL,
-            resource_id             INTEGER NULL,
-            job_status_id           INTEGER NULL,
-            job_type_id             INTEGER NULL,
-            address_id              INTEGER NULL,
-            place_id                INTEGER NULL,
-            priority                INTEGER DEFAULT 0 NOT NULL,
-            time_setup              INTEGER,
-            time_service            INTEGER,
-            time_overlap            INTEGER,
-            distance                INTEGER DEFAULT 0 NOT NULL,
-            time_distance           INTEGER DEFAULT 0 NOT NULL,
-            work_duration           INTEGER DEFAULT 0 NOT NULL,
-            plan_start_date         TIMESTAMP NOT NULL,
-            plan_end_date           TIMESTAMP NOT NULL,
-            ajustment_start_date    TIMESTAMP NULL,
-            ajustment_end_date      TIMESTAMP NULL,
-            actual_start_date       TIMESTAMP NULL,
-            actual_end_date         TIMESTAMP NULL,
-            time_limit_start        TIMESTAMP NULL,
-            time_limit_end          TIMESTAMP NULL,
-            complements             JSON NULL,
-            created_by              VARCHAR NOT NULL,
-            created_date            TIMESTAMP NOT NULL,
-            modified_by             VARCHAR NOT NULL,
-            modified_date           TIMESTAMP NOT NULL,
-            PRIMARY KEY (client_id, job_id),
-            UNIQUE (client_id, client_job_id) );
-
-        CREATE SEQUENCE IF NOT EXISTS seq_resource_id;        
-        CREATE TABLE IF NOT EXISTS resources (
-            uid                     UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_id               INTEGER NOT NULL,
-            resource_id             INTEGER NOT NULL,
-            client_resource_id      VARCHAR NOT NULL,
-            description             VARCHAR NOT NULL,
-            actual_geocode_lat DOUBLE,
-            actual_geocode_long DOUBLE,
-            geocode_lat_from DOUBLE,
-            geocode_long_from DOUBLE,
-            geocode_lat_at DOUBLE,
-            geocode_long_at DOUBLE,
-            fl_off_shift INTEGER DEFAULT 0 NOT NULL,
-            logged_in TIMESTAMP,
-            logged_out TIMESTAMP,
-            time_setup INTEGER,
-            time_service INTEGER,
-            time_overlap INTEGER,
-            created_by              VARCHAR NOT NULL,
-            created_date            TIMESTAMP NOT NULL,
-            modified_by             VARCHAR NOT NULL,
-            modified_date           TIMESTAMP NOT NULL,
-            modified_date_geo TIMESTAMP NOT NULL,
-            modified_date_login TIMESTAMP NOT NULL,
-                 PRIMARY KEY (client_id, resource_id),
-                 UNIQUE (client_id, client_resource_id)
-        );
-
-        CREATE SEQUENCE IF NOT EXISTS seq_team_id;
-        CREATE TABLE IF NOT EXISTS teams (
-            client_id INTEGER NOT NULL,
-            team_id INTEGER NOT NULL,
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_team_id VARCHAR NOT NULL,
-            team_name VARCHAR NOT NULL,
-            time_setup INTEGER,
-            time_overlap INTEGER,
-            time_service INTEGER,
-            start_time TIME NOT NULL DEFAULT '08:00:00',
-            end_time TIME NOT NULL DEFAULT '18:00:00',
-            geocode_lat DOUBLE,
-            geocode_long DOUBLE,
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            PRIMARY KEY (client_id, team_id),
-            UNIQUE (client_id, client_team_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_team_00 ON teams (client_team_id, client_id);
-        CREATE INDEX IF NOT EXISTS idx_team_01 ON teams (modified_date, client_id);
-
-        -- 3. Tabela: job_status
-        CREATE SEQUENCE IF NOT EXISTS seq_job_status_id;
-
-        CREATE TABLE IF NOT EXISTS job_status (
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_id INTEGER NOT NULL,
-            job_status_id INTEGER NOT NULL,
-            client_job_status_id VARCHAR NOT NULL,
-            style_id INTEGER,
-            description VARCHAR NOT NULL,
-            internal_code_status VARCHAR, 
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-
-            PRIMARY KEY (client_id, job_status_id),
-            UNIQUE (client_id, client_job_status_id),
-            
-        );
-
-        -- 4. Tabela: job_types
-        CREATE SEQUENCE IF NOT EXISTS seq_job_type_id;
-        CREATE TABLE IF NOT EXISTS job_types (
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_id INTEGER NOT NULL,
-            job_type_id INTEGER NOT NULL,
-            client_job_type_id VARCHAR NOT NULL,
-            style_id INTEGER,
-            description VARCHAR NOT NULL,
-           
-            priority INTEGER NOT NULL DEFAULT 25,
-            
-            time_setup INTEGER,
-            time_service INTEGER,
-            time_overlap INTEGER,
-            
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            
-            -- Constraints de Integridade
-            PRIMARY KEY (client_id, job_type_id),
-            UNIQUE (client_id, client_job_type_id),
-            
-        );
-        CREATE SEQUENCE IF NOT EXISTS seq_style_id;
-
-        -- 2. Tabela: styles
-        CREATE TABLE IF NOT EXISTS styles (
-            client_id INTEGER NOT NULL,
-            
-            style_id INTEGER NOT NULL,
-            
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            
-            client_style_id VARCHAR,
-            font_weight VARCHAR,
-            
-            background VARCHAR NOT NULL DEFAULT '#FFFFFF',
-            foreground VARCHAR NOT NULL DEFAULT '#000000',
-            
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            
-            PRIMARY KEY (client_id, style_id),
-            
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_styles_01 ON styles (modified_date, client_id);
+    async with engine.begin() as conn:
         
-        -- 2. Tabela: places
+        # await conn.run_sync(Base.metadata.drop_all)
+        # logger.info("Tabelas do banco dropadas com sucesso!")
+        # await r.flushall()
+        # logger.info("Cache Redis limpo com sucesso!")
 
-        CREATE SEQUENCE IF NOT EXISTS seq_place_id;
-                
-        CREATE TABLE IF NOT EXISTS places (
-            client_id INTEGER NOT NULL,
-            place_id INTEGER NOT NULL,
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_place_id VARCHAR NOT NULL,
-            trade_name VARCHAR,
-            cnpj VARCHAR,
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            PRIMARY KEY (client_id, place_id),
-            
-            CONSTRAINT uk_place UNIQUE (client_id, client_place_id),
-            
-        );
+        await conn.run_sync(Base.metadata.create_all)
+        logger.info("Tabelas do banco verificadas/criadas com sucesso!")
 
-        CREATE INDEX IF NOT EXISTS idx_place_00 ON places (client_place_id, client_id);
-        CREATE INDEX IF NOT EXISTS idx_place_01 ON places (modified_date, client_id);
-
-        -- 2. Tabela: address
-
-        CREATE SEQUENCE IF NOT EXISTS seq_address_id;
-        CREATE TABLE IF NOT EXISTS address (
-            client_id INTEGER NOT NULL,
-            address_id INTEGER NOT NULL,
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            client_address_id VARCHAR NOT NULL,
-            geocode_lat DOUBLE,
-            geocode_long DOUBLE,
-            address VARCHAR,
-            city VARCHAR,
-            state_prov VARCHAR,
-            zippost VARCHAR,
-            time_setup INTEGER,
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            PRIMARY KEY (client_id, address_id),
-            
-            CONSTRAINT uk_address UNIQUE (client_id, client_address_id)
-        );
-            
-        CREATE INDEX IF NOT EXISTS idx_address_00 ON address (client_address_id, client_id);
-        CREATE INDEX IF NOT EXISTS idx_address_01 ON address (modified_date, client_id);
-                
-        -- 2. Tabela: team_members
-
-        CREATE TABLE IF NOT EXISTS team_members (
-            client_id INTEGER NOT NULL,
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            team_id INTEGER NOT NULL,
-            resource_id INTEGER NOT NULL,
-            created_by VARCHAR NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-            PRIMARY KEY (client_id, team_id, resource_id)
-        );
-        
-        -- resource windows
-        CREATE SEQUENCE IF NOT EXISTS seq_rw_id;
-
-        CREATE TABLE IF NOT EXISTS resource_windows (
-            client_id INTEGER NOT NULL,
-            resource_id INTEGER NOT NULL,
-            rw_id INTEGER PRIMARY KEY,
-            client_rw_id VARCHAR NOT NULL,
-            
-            uid UUID UNIQUE DEFAULT gen_random_uuid(),
-            
-            week_day INTEGER NOT NULL,
-            style_id INTEGER,
-            description VARCHAR(128) NOT NULL,
-
-            start_time TIME NOT NULL,
-            end_time TIME NOT NULL,
-            
-            created_by VARCHAR(32) NOT NULL,
-            created_date TIMESTAMP NOT NULL,
-            modified_by VARCHAR(32) NOT NULL,
-            modified_date TIMESTAMP NOT NULL,
-
-            CONSTRAINT fk_resource_windows_styles 
-                FOREIGN KEY (client_id, style_id) REFERENCES styles (client_id, style_id),
-                
-            CONSTRAINT uk_resource_windows 
-                UNIQUE (client_id, resource_id, week_day, start_time, end_time),
-
-            CONSTRAINT ck_resource_window_week_day 
-                CHECK (week_day >= 1 AND week_day <= 7)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_resource_windows_01 ON resource_windows (modified_date, client_id);
-    """)
+    await create_tables(dbd)
     
     async with SessionLocal() as db:
         rClient = await db.execute(select(models.Clients.__table__))
@@ -1217,14 +1436,15 @@ async def lifespan(app: FastAPI):
             CREATE TABLE IF NOT EXISTS clients AS
                     select * from df_client;
                     """)
-    r = redis_client.get_redis()
-    task = asyncio.create_task(processo_em_background())
+    
+    # task = asyncio.create_task(processo_em_background())
+    task_scheduled = asyncio.create_task(scheduled_process())
     yield
         
-    task.cancel()
+    # task.cancel()
+    task_scheduled.cancel()
 
 app = FastAPI(lifespan=lifespan)
-
 
 app.include_router(duckdb_router)
 
@@ -1346,7 +1566,7 @@ async def events_endpoint(
 
         except asyncio.CancelledError:
             logger.info(f"Session {session_web_id} desconectou.")
-            asyncio.create_task(cleanSessionsRedis(r, session_web_id))
+            
         finally:
             await pubsub.unsubscribe(f"notify:{session_web_id}:notify")
             await r.close()
@@ -1461,48 +1681,55 @@ async def getStyles(
     return stylesDb
 
 @app.get("/jobstatus", response_model=List[schemas.JobStatusResponse])
-async def getJobStatus(
-    db: AsyncSession = Depends(database.get_db),
+async def getJobStatusApi(
     current_user: dict = Depends(get_current_user)
 ):
     clientId = current_user["clientId"]
-    result = await db.execute(
-        select(models.JobStatus)
-        .where(models.JobStatus.client_id == clientId)
-        .order_by(models.JobStatus.job_status_id)
-    )
-    return result.scalars().all()
+    rows = dbd.execute(
+        "SELECT * FROM job_status WHERE client_id = ? ORDER BY job_status_id",
+        [clientId]
+    ).fetchall()
+
+    cols = [d[0] for d in dbd.description]
+    return [dict(zip(cols, row)) for row in rows]
 
 @app.patch("/jobstatus/{job_status_id}", response_model=schemas.JobStatusResponse)
 async def updateJobStatus(
     job_status_id: int,
     body: schemas.JobStatusUpdateRequest,
-    db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
     clientId = current_user["clientId"]
     userId   = current_user["userName"]
 
-    result = await db.execute(
-        select(models.JobStatus).where(
-            models.JobStatus.client_id    == clientId,
-            models.JobStatus.job_status_id == job_status_id
-        )
-    )
-    job_status = result.scalar_one_or_none()
-    if not job_status:
+    row = dbd.execute(
+        "SELECT * FROM job_status WHERE client_id = ? AND job_status_id = ?",
+        [clientId, job_status_id]
+    ).fetchone()
+
+    if not row:
         raise HTTPException(status_code=404, detail="Status não encontrado")
 
     updates = body.model_dump(exclude_unset=True)
-    for field, value in updates.items():
-        setattr(job_status, field, value)
+    updates["modified_by"]   = str(userId)
+    updates["modified_date"] = datetime.now()
 
-    job_status.modified_by   = str(userId)
-    job_status.modified_date = datetime.now()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values     = list(updates.values()) + [clientId, job_status_id]
 
-    await db.commit()
-    await db.refresh(job_status)
-    return job_status
+    dbd.execute(
+        f"UPDATE job_status SET {set_clause} WHERE client_id = ? AND job_status_id = ?",
+        values
+    )
+
+    result = dbd.execute(
+        "SELECT * FROM job_status WHERE client_id = ? AND job_status_id = ?",
+        [clientId, job_status_id]
+    ).fetchone()
+
+    asyncio.create_task(commitOnDb(clientId=clientId, table='job_status'))
+
+    return dict(zip([d[0] for d in dbd.description], result))
 
 @app.patch("/jobs/{job_id}/reschedule", response_model=schemas.JobRescheduleResponse)
 async def rescheduleJob(
