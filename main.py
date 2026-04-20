@@ -79,25 +79,25 @@ async def calcDistance():
                     a.geocode_lat,
                     -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de chegada
                     CASE 
-                        WHEN r.geocode_lat_at IS NULL 
+                        WHEN COALESCE(r.geocode_lat_at, t.geocode_lat) IS NULL 
                         THEN FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
-                        ELSE r.geocode_lat_at 
+                        ELSE COALESCE(r.geocode_lat_at, t.geocode_lat) 
                     END AS geocode_lat_at,
                     CASE 
-                        WHEN r.geocode_long_at IS NULL 
+                        WHEN COALESCE(r.geocode_long_at, t.geocode_long) IS NULL 
                         THEN FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
-                        ELSE r.geocode_long_at 
+                        ELSE COALESCE(r.geocode_long_at, t.geocode_long)
                     END AS geocode_long_at,
                     -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de partida
                     CASE 
-                        WHEN r.geocode_lat_from IS NULL 
+                        WHEN COALESCE(r.geocode_lat_from, t.geocode_lat) IS NULL 
                         THEN FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
-                        ELSE r.geocode_lat_from 
+                        ELSE COALESCE(r.geocode_lat_from, t.geocode_lat) 
                     END AS geocode_lat_from,
                     CASE 
-                        WHEN r.geocode_long_from IS NULL 
+                        WHEN COALESCE(r.geocode_long_from, t.geocode_long) IS NULL 
                         THEN FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC)
-                        ELSE r.geocode_long_from 
+                        ELSE COALESCE(r.geocode_long_from, t.geocode_long) 
                     END AS geocode_long_from,
                     -- verifica se existe algum distance nulo no periodo, então processa
                     bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date, j.plan_start_date))) AS null_distance,
@@ -255,7 +255,8 @@ async def calcDistance():
             })
 
         asyncio.create_task(commitOnDb(clientId=1, table='jobs'))
-
+        
+        dbd.execute(" UPDATE semaforo SET status = 1 WHERE process = 'calcDistance' ")
             
     except Exception as e:
         log_error(e, "[calcDistance] Erro ao processar duckdb")
@@ -283,6 +284,7 @@ async def checkPendencias():
             address = f'{row["address"]}, {row["city"]}, {row["state_prov"]}'
             print(f"Pendência encontrada para o endereço: {address}. Iniciando processo de geocodificação...")
             retorno = await geocode_mapbox(address)
+            print(retorno)
             geocode_long = retorno["longitude"]
             geocode_lat = retorno["latitude"]
             smtp = """
@@ -297,6 +299,38 @@ async def checkPendencias():
         
         if result and len(result) > 0:
             asyncio.create_task(commitOnDb(clientId=1, table='address'))
+
+        stmt = """
+            UPDATE resources 
+               set geocode_lat_from = NULL,
+                geocode_long_from = NULL,
+                geocode_long_at = NULL,
+                geocode_lat_at = NULL
+            WHERE  COALESCE(geocode_lat_from, 0) = 0  
+                OR COALESCE(geocode_long_from,0) = 0
+                OR geocode_lat_from < -40 
+                OR geocode_lat_from > 10
+                OR geocode_long_from < -80 
+                OR geocode_long_from > -30
+                OR COALESCE(geocode_lat_at, 0) = 0  
+                OR COALESCE(geocode_long_at, 0) = 0
+                OR geocode_lat_at < -40 
+                OR geocode_lat_at > 10
+                OR geocode_long_at < -80 
+                OR geocode_long_at > -30;
+            UPDATE teams 
+               set geocode_lat = NULL,
+                geocode_long = NULL
+            WHERE  COALESCE(geocode_lat, 0) = 0  
+                OR COALESCE(geocode_long, 0) = 0
+                OR geocode_lat < -40 
+                OR geocode_lat > 10
+                OR geocode_long < -80 
+                OR geocode_long > -30
+                
+        """
+        result = dbd.execute(stmt)
+        dbd.execute(" UPDATE semaforo SET status = 1 WHERE process = 'checkPendencias' ")
 
     except Exception as e:
         log_error(e)
@@ -419,6 +453,7 @@ async def getBackup():
                             dbd.execute(stmt)
                             result = dbd.execute(f"select count(*) AS Total from {table}").pl().to_dicts()
                             print(f"[Tabela {table}] Total de linhas restauradas ... ", result)
+        dbd.execute(" UPDATE semaforo SET status = 1 WHERE process = 'getBackup' ")
     except Exception as e:
         log_error(e)
 
@@ -1345,15 +1380,16 @@ async def scheduled_process():
             result = await db.execute(stmt)
             rows = result.mappings().all()
             if rows[0]['json_data'] is not None:
-                df_data = pl.DataFrame(rows[0]['json_data'])
+                df_data = pl.DataFrame(rows[0]['json_data'], infer_schema_length=None)
                 stmt = "CREATE TABLE IF NOT EXISTS schedule_process AS SELECT * FROM df_data"
                 dbd.execute(stmt)
-                print(stmt)
+                # print(stmt)
             
             stmt = text("""
                 with q1 as(
                     select
                         client_id, 
+                        report_id,
                         client_team_id, 
                         report_date, 
                         rebuild 
@@ -1365,21 +1401,38 @@ async def scheduled_process():
             result = await db.execute(stmt)
             rows = result.mappings().all()
             if rows[0]['json_data'] is not None:
-                print(rows[0]['json_data'])
-                df_data = pl.DataFrame(rows[0]['json_data'])
-                stmt = "INSERT INTO reports AS SELECT * FROM df_data"
+                # print(rows[0]['json_data'])
+                df_data = pl.DataFrame(rows[0]['json_data'], infer_schema_length=None)
+
+                lista_colunas = dbd.execute(f"""
+                        SELECT string_agg(name,', ' ORDER BY cid ASC)
+                        FROM pragma_table_info('reports') 
+                    """).fetchone()[0]
+                print(df_data)
+                stmt = f"INSERT INTO reports ({lista_colunas}) SELECT {lista_colunas} FROM df_data"
                 dbd.execute(stmt)
                 print(stmt)
 
         while True:
             try:
-                await getBackup()
-                await asyncio.sleep(0.5)
-                await checkPendencias()
-                await asyncio.sleep(0.5)
+                print("Verificando atualizações agendadas...")
+                isNotExists = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM semaforo WHERE process = 'getBackup')").fetchone()[0]
+                if isNotExists:
+                    await asyncio.sleep(5)
+                    continue
+                isNotExists = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM semaforo WHERE process = 'checkPendencias')").fetchone()[0]
+                if isNotExists:
+                    await asyncio.sleep(5)
+                    continue
+                isNotExists = dbd.execute(f"SELECT NOT EXISTS (SELECT 1 FROM semaforo WHERE process = 'calcDistance')").fetchone()[0]
+                if isNotExists:
+                    await asyncio.sleep(5)
+                    continue
                 print("Verificando agendamentos...")
-                clients = await db.execute(text("SELECT client_id FROM clients"))
-                client_ids = [row[0] for row in clients.fetchall()]
+                client_ids = []
+                async with SessionLocal() as db:
+                    clients = await db.execute(text("SELECT client_id FROM clients"))
+                    client_ids = [row[0] for row in clients.fetchall()]
                 for clientId in client_ids:
                     print(f"Verificando agendamento para o cliente {clientId}...")
                     vTime = datetime.now().time().strftime("%H:%M:") + "00"
@@ -1390,7 +1443,7 @@ async def scheduled_process():
                         asyncio.create_task(buildReports(clientId, dbd, db))
                 # await asyncio.sleep(10)
 
-                asyncio.create_task(buildReports(clientId, dbd, db))
+                    asyncio.create_task(buildReports(clientId, dbd, db))
                 # await asyncio.sleep(0.5)
                 # await asyncio.sleep(0.5)
                 # await getPriority(r)
@@ -1437,11 +1490,11 @@ async def lifespan(app: FastAPI):
                     select * from df_client;
                     """)
     
-    # task = asyncio.create_task(processo_em_background())
+    task = asyncio.create_task(processo_em_background())
     task_scheduled = asyncio.create_task(scheduled_process())
     yield
         
-    # task.cancel()
+    task.cancel()
     task_scheduled.cancel()
 
 app = FastAPI(lifespan=lifespan)
@@ -1647,36 +1700,35 @@ async def getCurrentClient(
 
 @app.get("/teams", response_model=List[schemas.ViewTeamResponse])
 async def getTeams(
-    db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
     user_id = current_user["userId"]
     client_id = current_user["clientId"]
 
-    result = await db.execute(
-        select(models.Teams)
-        .join(models.UserTeam, 
-              (models.UserTeam.team_id == models.Teams.team_id) & 
-              (models.UserTeam.client_id == models.Teams.client_id))
-        .where(
-            models.UserTeam.user_id == user_id,
-            models.UserTeam.client_id == client_id
-        )
-    )
-    teamsDb = result.scalars().all()
+    result = dbd.execute("""
+        select * 
+            from teams t
+            join user_team ut on ut.team_id = t.team_id and ut.client_id = t.client_id
+            where ut.user_id = $user_id and ut.client_id = $client_id
+        """, {"user_id": user_id, "client_id": client_id})
+
+    teamsDb = result.pl().to_dicts()
 
     return teamsDb
 
 @app.get("/styles", response_model=List[schemas.ViewStylesResponse])
 async def getStyles(
-    db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
     clientId = current_user["clientId"]
-        
-    result = await db.execute(select(models.Styles).where(models.Styles.client_id == clientId))
-    
-    stylesDb = result.scalars().all()
+
+    result = dbd.execute("""
+        select * 
+            from styles t
+           where t.client_id = $client_id
+        """, { "client_id": clientId})
+
+    stylesDb = result.pl().to_dicts()
 
     return stylesDb
 
@@ -1700,7 +1752,7 @@ async def updateJobStatus(
     current_user: dict = Depends(get_current_user)
 ):
     clientId = current_user["clientId"]
-    userId   = current_user["userName"]
+    userName   = current_user["userName"]
 
     row = dbd.execute(
         "SELECT * FROM job_status WHERE client_id = ? AND job_status_id = ?",
@@ -1711,7 +1763,7 @@ async def updateJobStatus(
         raise HTTPException(status_code=404, detail="Status não encontrado")
 
     updates = body.model_dump(exclude_unset=True)
-    updates["modified_by"]   = str(userId)
+    updates["modified_by"]   = userName
     updates["modified_date"] = datetime.now()
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -1767,33 +1819,6 @@ async def rescheduleJob(
     await db.refresh(job)
     return job
 
-# @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
-# async def getResourceWindows(
-#     week_day: int = Query(..., description="Dia da semana Inteiro"),
-#     db: AsyncSession = Depends(database.get_db),
-#     current_user: dict = Depends(get_current_user)
-# ):
-#     user_id = current_user["userId"]
-#     client_id = current_user["clientId"]
-
-#     result = await db.execute(
-#         select(models.ResourceWindows)
-#         .join(models.TeamMembers,
-#               (models.TeamMembers.resource_id == models.ResourceWindows.resource_id) &
-#               (models.TeamMembers.client_id == models.ResourceWindows.client_id))
-#         .join(models.UserTeam,
-#               (models.UserTeam.team_id == models.TeamMembers.team_id) &
-#               (models.UserTeam.client_id == models.TeamMembers.client_id))
-#         .where(
-#             models.UserTeam.user_id == user_id,
-#             models.UserTeam.client_id == client_id,
-#             models.ResourceWindows.week_day == week_day
-#         )
-#         .distinct()
-#     )
-#     resourceWindowDb = result.scalars().all()
-
-#     return resourceWindowDb
 
 @app.get("/resourcewindows", response_model=List[schemas.ViewResourceWindowsResponse])
 async def getResourceWindows(
@@ -1820,64 +1845,6 @@ async def getResourceWindows(
     """,parametros).pl().to_dicts()
 
     return result
-# @app.get("/resourcestree")
-# async def getResourcesTree(
-#     db: AsyncSession = Depends(database.get_db),
-#     current_user: dict = Depends(get_current_user)
-# ):
-#     user_id = current_user["userId"]
-#     client_id = current_user["clientId"]
-
-#     try:
-#         # Tenta executar uma query simples no banco
-#         smtp = text("""
-#           with q1 as (
-#             select 
-#             client_id,
-#             resource_id,
-#             uid as resource_uid,
-#             client_resource_id,
-#             description,
-#             actual_geocode_lat,
-#             actual_geocode_long,
-#             geocode_lat_from,
-#             geocode_long_from,
-#             geocode_lat_at,
-#             geocode_long_at,
-#             fl_off_shift,
-#             time_setup,
-#             time_service,
-#             time_overlap,
-#             logged_in,
-#             logged_out,
-#             modified_date
-#             from resources
-#           )
-#           select t.team_id,
-#           t.uid AS team_uid,
-#           t.client_team_id,
-#           t.team_name,
-#           jsonb_agg(to_jsonb(q1) ORDER BY q1.description) AS resources
-#           from teams t
-#           join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-#           join team_members tm on tm.client_id = t.client_id and  tm.team_id = t.team_id
-#           join q1 on q1.client_id = t.client_id and q1.resource_id = tm.resource_id
-#           where ut.client_id = :client_id and ut.user_id = :user_id
-#           group by t.team_id,
-#           t.uid,
-#           t.client_team_id,
-#           t.team_name
-#         """).bindparams(client_id=client_id, user_id=user_id)
-                            
-#         result = await db.execute(smtp)
-#         rows = result.mappings().all()
-#         print(type(rows))
-#         arvore = [dict(row) for row in rows]
-#         return arvore
-        
-#     except Exception as e:
-#         logger.error(f"Erro ao conectar no banco: {e}")
-#         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
 
 @app.get("/resourcestree")
 async def getResourcesTree(
@@ -1946,93 +1913,9 @@ async def getResourcesTree(
         logger.error(f"Erro ao conectar no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
 
-# @app.get("/jobs")
-# async def getJobsResources(
-#     p_date: str = Query(..., description="Data no formato YYYY-MM-DD"),
-#     db: AsyncSession = Depends(database.get_db),
-#     current_user: dict = Depends(get_current_user)
-# ):
-    
-#     userId = current_user["userId"]
-#     userName = current_user["userName"]
-#     clientId = current_user["clientId"]
-
-    
-#     # for r in geoResult:
-#     #    print(r)
-#     try:
-#         # Tenta executar uma query simples no banco
-#         smtp = text("""
-#           select 
-#             'ORIGIN' as type,
-#             j.job_id,
-#             j.client_job_id,
-#             j.team_id, 
-#             j.resource_id, 
-#             r.client_resource_id,
-#             j.job_status_id, 
-#             js.description AS status_description,
-#             js.internal_code_status,
-#             js.style_id,
-#             j.job_type_id, 
-#             jt.description as type_description,
-#             j.address_id, 
-#             a.client_address_id, 
-#             a.geocode_lat, 
-#             a.geocode_long, 
-#             a.address, 
-#             a.city, 
-#             a.state_prov, 
-#             a.zippost, 
-#             a.time_setup,
-#             j.distance,
-#             j.time_distance,
-#             p.trade_name, 
-#             p.cnpj,
-#             j.time_setup, 
-#             j.time_service, 
-#             COALESCE(j.ajustment_start_date, j.plan_start_date) as plan_start_date, 
-#             COALESCE(j.ajustment_end_date,j.plan_end_date) as plan_end_date, 
-#             j.actual_start_date, 
-#             j.actual_end_date, 
-#             COALESCE(j.actual_start_date, j.ajustment_start_date, j.plan_start_date) as start_date,
-#             COALESCE(j.actual_end_date, j.ajustment_end_date, j.plan_end_date) as start_date,
-#             j.time_limit_start, 
-#             j.time_limit_end
-#             from jobs j
-#             join job_types jt on jt.client_id = j.client_id and jt.job_type_id = j.job_type_id
-#             join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-#             join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-#             join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-#             join address a on a.client_id = j.client_id and a.address_id = j.address_id
-#             join places p on p.client_id = j.client_id and p.place_id = j.place_id
-#             left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-#             where ut.client_id = :client_id
-#               and ut.user_id = :user_id
-#               --and (js.internal_code_status <> 'CONCLU' OR js.internal_code_status IS NULL)
-#               and (
-#                     (j.actual_start_date is null and j.plan_start_date >= cast(:p_date as date) and j.plan_start_date < cast(:p_date as date) + interval '1 day')
-#                   or (
-#                     j.actual_start_date is not null AND (j.actual_start_date >= cast(:p_date as date) and j.actual_start_date < cast(:p_date as date) + interval '1 day')
-#                     )
-#                   )
-#             order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
-#         """).bindparams(client_id=clientId, user_id=userId, p_date=p_date)
-                            
-#         result = await db.execute(smtp)
-#         rows = result.mappings().all()
-
-#         res = [dict(row) for row in rows]
-#         return res
-        
-#     except Exception as e:
-#         logger.error(f"[getJobsResources] Erro ao conectar no banco: {e}")
-#         raise HTTPException(status_code=500, detail="Erro de conexão com o banco de dados")
-
 @app.get("/jobs")
 async def getJobsResources(
     p_date: str = Query(..., description="Data no formato YYYY-MM-DD"),
-    db: AsyncSession = Depends(database.get_db),
     current_user: dict = Depends(get_current_user)
 ):
     
@@ -2092,13 +1975,18 @@ async def getJobsResources(
             left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
             where j.client_id = $client_id
               and ut.user_id = $user_id
-              --and (js.internal_code_status <> 'CONCLU' OR js.internal_code_status IS NULL)
-              and (
-                    (j.actual_start_date is null and j.plan_start_date >= cast($p_date as date) and j.plan_start_date < cast($p_date as date) + interval 1 day)
-                  or (
-                    j.actual_start_date is not null AND (j.actual_start_date >= cast($p_date as date) and j.actual_start_date < cast($p_date as date) + interval 1 day)
-                    )
-                  )
+              AND 1 = CASE 
+                        WHEN COALESCE(j.actual_start_date, j.ajustment_start_date, j.plan_start_date) < cast(now() as date) 
+                            THEN 
+                                CASE 
+                                    WHEN js.internal_code_status NOT IN ('CONCLU', 'CANCEL', 'CLOSED') THEN 1
+                                    ELSE 0
+                                END
+                            ELSE 1
+                    END
+              and COALESCE(j.actual_start_date, j.ajustment_start_date, j.plan_start_date) >= cast($p_date as date)
+              and COALESCE(j.actual_start_date, j.ajustment_start_date, j.plan_start_date) < cast($p_date as date) + interval 1 day
+              
             order by j.team_id, j.resource_id nulls last,j.actual_start_date nulls last, j.plan_start_date
         """
 
@@ -2129,73 +2017,64 @@ async def getOpenJobs(
     userName = current_user["userName"]
     clientId = current_user["clientId"]
     try:
-      simulation_filter = ""
-      bind_params: dict = {"client_id": clientId, "user_id": userId, "team_id": team_id}
-      if simulation_id is not None:
-         
-          simulation_filter = """
-                and not exists (
-                    select 1 from simulation_view sw
-                    where sw.client_id = j.client_id
-                      and sw.job_id = j.job_id
-                      and sw.simulation_id = :simulation_id
-                )"""
-          bind_params["simulation_id"] = simulation_id
 
-      smtp = text(f"""
-        select
-              j.client_id,
-              j.job_id,
-              j.client_job_id,
-              j.team_id,
-              j.resource_id,
-              r.client_resource_id,
-              r.description AS resource_name,
-              r.geocode_lat_from,
-              r.geocode_long_from,
-              r.geocode_lat_at,
-              r.geocode_long_at,
-              j.job_status_id,
-              js.description,
-              j.job_type_id,
-              j.address_id,
-              a.geocode_lat,
-              a.geocode_long,
-              a.address,
-              a.city,
-              a.state_prov,
-              j.place_id,
-              p.trade_name,
-              p.cnpj,
-              j.time_setup,
-              j.time_service,
-              j.time_limit_start,
-              j.time_limit_end,
-              j.actual_start_date,
-              j.actual_end_date,
-              j.plan_start_date,
-              j.plan_end_date,
-              j.pp_resource_id,
-              j.time_limit_end
-              from jobs j
-              join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
-              join teams t on t.client_id = j.client_id and t.team_id = j.team_id
-              join address a on a.client_id = j.client_id and a.address_id = j.address_id
-              join places p on p.client_id = j.client_id and p.place_id = j.place_id
-              join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
-              left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
-              where ut.client_id = :client_id
-                and ut.user_id = :user_id
-                and j.team_id = :team_id
-                and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') AND  js.internal_code_status IS NOT NULL)
-                 {simulation_filter}
-            order by j.team_id, j.resource_id nulls last, j.actual_start_date, j.plan_start_date,  a.geocode_lat, a.geocode_long
-        """).bindparams(**bind_params)
-      result = await db.execute(smtp)
-      rows = result.mappings().all()
+        smtp = """
+            select
+                j.client_id,
+                j.job_id,
+                j.client_job_id,
+                j.team_id,
+                j.resource_id,
+                r.client_resource_id,
+                r.description AS resource_name,
+                r.geocode_lat_from,
+                r.geocode_long_from,
+                r.geocode_lat_at,
+                r.geocode_long_at,
+                j.job_status_id,
+                js.description,
+                j.job_type_id,
+                j.address_id,
+                a.geocode_lat,
+                a.geocode_long,
+                a.address,
+                a.city,
+                a.state_prov,
+                j.place_id,
+                p.trade_name,
+                p.cnpj,
+                j.time_setup,
+                j.time_service,
+                j.time_limit_start,
+                j.time_limit_end,
+                j.actual_start_date,
+                j.actual_end_date,
+                j.plan_start_date,
+                j.plan_end_date,
+                j.time_limit_end
+            from jobs j
+                join job_status js on js.client_id = j.client_id and js.job_status_id = j.job_status_id
+                join teams t on t.client_id = j.client_id and t.team_id = j.team_id
+                join address a on a.client_id = j.client_id and a.address_id = j.address_id
+                join places p on p.client_id = j.client_id and p.place_id = j.place_id
+                join user_team ut on ut.client_id = t.client_id and ut.team_id = t.team_id
+                left join resources r on j.client_id = r.client_id and j.resource_id = r.resource_id
+                where ut.client_id = $client_id
+                    and ut.user_id = $user_id
+                    and j.team_id = $team_id
+                    and (js.internal_code_status not in ('CONCLU', 'CANCEL', 'CLOSED') AND  js.internal_code_status IS NOT NULL)
+                    and not exists (
+                        select 1 from simulation_view sw
+                        where sw.client_id = j.client_id
+                        and sw.job_id = j.job_id
+                        and sw.simulation_id = $simulation_id
+                    )
 
-      res = [dict(row) for row in rows]
-      return res
+                order by j.team_id, j.resource_id nulls last, j.actual_start_date, j.plan_start_date,  a.geocode_lat, a.geocode_long
+        """
+        result = dbd.execute(smtp, {"client_id": clientId, "user_id": userId, "team_id": team_id, "simulation_id": simulation_id}  )
+        res = result.pl().to_dicts()
+        return res
         
     except Exception as e:
         logger.error(f"[getOpenJobs] Erro ao conectar no banco: {e}")
@@ -2248,51 +2127,20 @@ async def createNewSimulation(
 
     try:
         # Determina o próximo número de sequência para este usuário/cliente
-        rLast = await db.execute(
-            select(models.Simulation)
-            .where(
-                models.Simulation.client_id == clientId,
-                models.Simulation.user_id   == userId,
-                models.Simulation.session   == session,
-            )
-            .order_by(models.Simulation.sequence.desc())
-        )
-        lastSimulation = rLast.scalars().first()
-        nextSequence   = (lastSimulation.sequence + 1) if lastSimulation else 1
-
-        now = datetime.now()
-
-        newSimulation = models.Simulation(
-            client_id       = clientId,
-            user_id         = userId,
-            team_id         = teamId,
-            simulation_date = date.fromisoformat(p_date),
-            session         = session,
-            sequence        = nextSequence,
-            created_by      = userName,
-            created_date    = now,
-            modified_by     = userName,
-            modified_date   = now,
-        )
-        db.add(newSimulation)
-        await db.commit()
-        await db.refresh(newSimulation)
-        
-        logger.info(
-            "[newroutes] Simulação criada | client={} user={} team_id={} sim_id={} seq={} date={} session={}",
-            clientId, userId, teamId, newSimulation.simulation_id, nextSequence, p_date, session,
-        )
-        return {
-            "simulation_id":   newSimulation.simulation_id,
-            "uid":             str(newSimulation.uid),
-            "team_id":       newSimulation.team_id,
-            "client_id":       newSimulation.client_id,
-            "user_id":         newSimulation.user_id,
-            "simulation_date": str(newSimulation.simulation_date),
-            "sequence":        newSimulation.sequence,
-            "session": newSimulation.session,
-            "created_date":    newSimulation.created_date.isoformat(),
-        }    
+        stmt = """ 
+            with last_simulation as (
+                select COALESCE(max(sequence), 0) + 1 as next_sequence
+                   from simulation
+                   where client_id = $client_id 
+                    and user_id = $user_id
+                     and session = $session)
+            insert into simulation (client_id, user_id, team_id, simulation_date, session, sequence, created_by, created_date, modified_by, modified_date)
+                values ($client_id, $user_id, $team_id, cast($p_date as date), $session, (select next_sequence from last_simulation), $user_name, now(), $user_name, now())
+            returning *
+            """
+        result = dbd.execute(stmt, {"client_id": clientId, "user_id": userId, "team_id": teamId, "p_date": p_date, "session": session, "user_name": userName}).pl().to_dicts()
+        print(result)
+        return result[0] if result else None
 
         
     except HTTPException:
@@ -3669,8 +3517,37 @@ async def updateResource(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    client_id = current_user["clientId"]
+    clientId = current_user["clientId"]
     user_name = current_user["userName"]
+
+    row = dbd.execute(
+        "SELECT * FROM resources WHERE client_id = ? AND resource_id = ?",
+        [clientId, resource_id]
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Resource não encontrado")
+
+    updates = body.model_dump(exclude_unset=True)
+    updates["modified_by"]   = user_name
+    updates["modified_date"] = datetime.now()
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values     = list(updates.values()) + [clientId, resource_id]
+
+    dbd.execute(
+        f"UPDATE resources SET {set_clause} WHERE client_id = ? AND resource_id = ?",
+        values
+    )
+
+    result = dbd.execute(
+        "SELECT * FROM resources WHERE client_id = ? AND resource_id = ?",
+        [clientId, resource_id]
+    ).fetchone()
+
+    asyncio.create_task(commitOnDb(clientId=clientId, table='resources'))
+
+    return dict(zip([d[0] for d in dbd.description], result))
 
     result = await db.execute(
         select(models.Resources).where(
@@ -4297,14 +4174,14 @@ async def getHistoryBestRouteJobs(
     userId = current_user["userId"]
     userName = current_user["userName"]
     clientId = current_user["clientId"]
-    
+    clientTeamId = dbd.execute("select client_team_id from teams where client_id = $client_id and team_id = $team_id", {"client_id": clientId, "team_id": teamId}).fetchone()[0] 
     smtp = text(f"""
         select report 
           from reports
          where client_id = :client_id
-           and team_id = :team_id
+           and client_team_id = :client_team_id
            and report_date = CAST(:p_date AS DATE)
-      """).bindparams(client_id=clientId, team_id = teamId, p_date = p_date)
+      """).bindparams(client_id=clientId, client_team_id = clientTeamId, p_date = p_date)
 
     result = await db.execute(smtp)
     rows = result.mappings().all()
@@ -4422,49 +4299,56 @@ async def scheduleJobs(
 
     async def calc_rote():
         if action =='C':
-            smtp = text("""
+            stmt = """
                 UPDATE simulation
-                    SET json_dado = '[]'::jsonb
-                WHERE client_id = :client_id
-                    AND simulation_id = :simulation_id
+                    SET json_dado = []::JSON
+                WHERE client_id = $client_id
+                    AND simulation_id = $simulation_id
                     RETURNING json_dado
-                """)
-            result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
-            await db.commit()
-            for row in result:
-                logger.warning(f'Reports finalizados!')
-                return row.json_dado 
+                """
+            dbd.execute(stmt, {"client_id": clientId, "simulation_id": simulationId})
+            return []
             
         if action =='D' and len(listJobs) == 0 and len(resources) == 1:
             smtp = text(f"""
                 UPDATE simulation
-                    SET json_dado = (
-                        SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
-                        FROM jsonb_array_elements(json_dado) AS elem
-                        WHERE (elem->>'resource_id')::INT NOT IN({','.join(str(j) for j in resources)})
+                SET json_dado = 
+                    to_json(
+                        
+                        COALESCE(
+                            (
+                                SELECT list(elem)
+                                FROM unnest(from_json(json_dado, '["JSON"]')) AS t(elem)
+                                WHERE NOT list_contains($resources, CAST(json_extract_string(elem, '$.resource_id') AS INT))
+                                
+                            ), 
+                            [] -- Lista vazia caso não sobre nenhum elemento
+                        ),
                     )
-                WHERE client_id = :client_id
-                    AND simulation_id = :simulation_id
-                    RETURNING json_dado
+                ,modified_by = 'system'
+                ,modified_date = CURRENT_TIMESTAMP
+
+                WHERE client_id = $client_id AND simulation_id = $simulation_id
+                RETURNING json_dado
                 """)
-            result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
+            result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId, "resources": resources})
             await db.commit()
             for row in result:
                 logger.warning(f'Reports finalizados!')
                 return row.json_dado
         
         logger.info(f"Iniciado Calculo das rotas ...action - {action}, {len(resources)}, {len(listJobs)}")                    
-        smtp = text(f"""
+        stmt = """
             WITH dados AS (
                 SELECT j.client_id
                     ,t.team_id
                     ,COALESCE(j.time_overlap, jt.time_overlap, t.time_overlap,0) AS time_overlap
                     ,j.job_id
                     ,j.address_id
-                    ,a.geocode_lat::NUMERIC geocode_lat
-                    ,a.geocode_long::NUMERIC geocode_long
-                    ,COALESCE (j.time_setup, jt.time_setup, t.time_setup) AS time_setup
-                    ,COALESCE (j.time_service, jt.time_service, t.time_service) AS time_service
+                    ,a.geocode_lat
+                    ,a.geocode_long
+                    ,COALESCE (j.time_setup, jt.time_setup, t.time_setup,0) AS time_setup
+                    ,COALESCE (j.time_service, jt.time_service, t.time_service,0) AS time_service
                     ,j.priority + (COALESCE (jt.priority, 0) / 100)::INTEGER AS priority
                     ,EXTRACT (epoch FROM COALESCE (aw.start_time, CAST ('00:00:00' AS TIME)))::INTEGER AS start_time
                     --,0 AS start_time
@@ -4486,9 +4370,10 @@ async def scheduleJobs(
                     ON     aw.client_id = j.client_id
                         AND aw.address_id = j.address_id
                         AND aw.week_day = EXTRACT (dow FROM COALESCE (j.actual_start_date, j.plan_start_date, now ())) + 1
-            WHERE   j.client_id = :client_id
-                AND s.simulation_id = :simulation_id
-                AND j.job_id IN ({','.join(str(j) for j in listJobs)})
+            WHERE   j.client_id = $client_id
+                AND s.simulation_id = $simulation_id
+                AND list_contains($job_list, j.job_id)
+                --AND j.job_id IN ({','.join(str(j) for j in listJobs)})
             ),
             MapeamentoEnderecos AS (
                 SELECT 
@@ -4506,7 +4391,7 @@ async def scheduleJobs(
                 FROM dados
             ),
             list as (
-                SELECT json_agg(job_id) AS job_id_list
+                SELECT json_group_array(job_id) AS job_id_list
                     FROM dados
             ),
             q1 as (
@@ -4530,17 +4415,17 @@ async def scheduleJobs(
                 select
                 r.resource_id,
                 r.description,
-                r.geocode_lat_from::NUMERIC,
-                r.geocode_long_from::NUMERIC,
-                r.geocode_lat_at::NUMERIC,
-                r.geocode_long_at::NUMERIC,
+                r.geocode_lat_from,
+                r.geocode_long_from,
+                r.geocode_lat_at,
+                r.geocode_long_at,
                 CASE 
                     WHEN DATE_TRUNC('day',now()) < s.simulation_date
                         THEN 
                             EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER
                     ELSE
                         CASE 
-                            WHEN (NOW()::TIME > COALESCE(rw.start_time,t.start_time))
+                            WHEN (get_current_time()::TIME > COALESCE(rw.start_time,t.start_time))
                                 THEN
                                     EXTRACT(EPOCH FROM NOW() - DATE_TRUNC('day',NOW()))::INTEGER
                             ELSE
@@ -4553,52 +4438,53 @@ async def scheduleJobs(
                 join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
                 join simulation s ON s.client_id = t.client_id and s.team_id = t.team_id
                 LEFT JOIN resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM s.simulation_date) + 1
-                where r.client_id = :client_id
-                and s.simulation_id = :simulation_id
-                and r.resource_id IN ({','.join(str(j) for j in resources)})
+                where r.client_id = $client_id
+                and s.simulation_id = $simulation_id
+                AND list_contains($resources, r.resource_id)
+                --and r.resource_id IN ({','.join(str(j) for j in resources)})
             ),
             vehicles_json AS (
-            SELECT json_agg(
-            json_strip_nulls(
-                json_build_object(
+            SELECT json_group_array(
+                json_object(
                     'id', resource_id,
                     'description', description,
-                    'start', json_build_array(geocode_long_from, geocode_lat_from),
-                    'end', json_build_array(geocode_long_at, geocode_lat_at),
-                    'time_window', json_build_array(start_time, end_time)
-                ))
+                    'start', json_array(geocode_long_from, geocode_lat_from),
+                    'end', json_array(geocode_long_at, geocode_lat_at),
+                    'time_window', json_array(start_time, end_time)
+                )
             ) AS array_vehicles
             FROM vehicles_data
             ),
             jobs_json AS (
                 -- Agrupa todos os jobs em um array JSON
-                SELECT json_agg(
-                json_strip_nulls(
-                    json_build_object(
+                SELECT json_group_array(
+                    json_object(
                         'id', job_id,
-                        'location', json_build_array(geocode_long, geocode_lat),
+                        'location', json_array(geocode_long, geocode_lat),
                         'setup', time_setup,
                         'service', time_service,
                         'priority', priority,
-                        'time_windows', json_build_array(json_build_array(start_time, end_time)) 
-                    ))
+                        'time_windows', json_array(json_array(start_time, end_time)) 
+                    )
                 ) AS array_jobs
                 FROM q1
             )
-            SELECT json_build_object(
+            SELECT json_object(
                 'vehicles', (SELECT array_vehicles FROM vehicles_json),
                 'jobs', (SELECT array_jobs FROM jobs_json),
                 'list', (SELECT job_id_list FROM list)
             ) AS vroom_payload;
-        """)
-        result = await db.execute(smtp, {"client_id": clientId, "simulation_id": simulationId})
-        subRow = result.mappings().first()
-        if not subRow:
-            return
-        background_tasks.add_task(logs, clientId=clientId, log='dados para vroom', logJson=dict(subRow))
-        vroom_payload = subRow['vroom_payload']
+        """
+        vroom_payload = json.loads(dbd.execute(stmt, {"client_id": clientId, "simulation_id": simulationId, "resources": resources, "job_list": listJobs}).fetchone()[0])
+        if not vroom_payload:
+            return []
+        asyncio.create_task(logs(clientId=clientId, log=f'dados para vroom Simulation {simulationId}', logJson=vroom_payload))
 
         vroomJobList = vroom_payload.pop('list', 'Chave não encontrada')
+        if not vroom_payload['vehicles'] or not vroom_payload['jobs']:
+            logger.debug(f'Veículos ou Jobs insuficientes para otimização. Veículos: {vroom_payload["vehicles"]}, Jobs: {vroom_payload["jobs"]}')
+            return []
+
         logger.info(list(vroomJobList))
         logger.info('Iniciando Otimização das rotas Simulação Janela Default ...')
         retorno = await optimize_routes_vroom(vroom_payload)
@@ -4620,15 +4506,15 @@ async def scheduleJobs(
                 rou['steps'][ln]['distance'] = x['distance']
         listIds = [item['id'] for item in retorno.get("unassigned", [])]
         if listIds:
-            background_tasks.add_task(logs, clientId=clientId, log='lista de unassigned', logJson=listIds)
+            asyncio.create_task(logs(clientId=clientId, log='lista de unassigned', logJson=listIds))
             logger.debug(f'Lista de jobs excluidas da rota... {listIds}')
 
-        background_tasks.add_task(logs, clientId=clientId, log='retorno do vroom', logJson=retorno)
+        asyncio.create_task(logs(clientId=clientId, log=f'retorno do vroom {simulationId}', logJson=retorno))
         logger.info('Terminou retorno ....')              
         vroomResult = json.dumps(retorno)
-        smtp = text(f"""
+        stmt = """
             WITH payload_data AS (
-                SELECT CAST(:vroom_data AS jsonb) AS data
+                SELECT CAST($vroom_data AS JSON) AS data
             ),
             rotas AS (
                 SELECT 
@@ -4636,7 +4522,7 @@ async def scheduleJobs(
                     rota_json->>'description' AS nome_motorista,
                     rota_json->'steps' AS passos_array
                 FROM payload_data,
-                    jsonb_array_elements(data->'routes') AS rota_json
+                    UNNEST(CAST(data->'routes' AS JSON[])) AS t(rota_json)
             ),
             q1 as (
                 SELECT
@@ -4644,15 +4530,15 @@ async def scheduleJobs(
                     ordem_passo::int AS sequence,
                     passo_json->>'type' AS stop_type,
                     (passo_json->>'id')::int AS job_id,
-                    (passo_json->'location'->>0)::numeric AS geocode_long,
-                    (passo_json->'location'->>1)::numeric AS geocode_lat,
+                    (passo_json->'location'->>0)::DOUBLE AS geocode_long,
+                    (passo_json->'location'->>1)::DOUBLE AS geocode_lat,
                     (passo_json->>'arrival')::int as arrival,
                     (passo_json->>'service')::int AS service,
                     (passo_json->>'setup')::int AS setup,
                     (passo_json->>'distance')::numeric::int AS distance,
                     (passo_json->>'time_distance')::numeric::int AS time_distance
                 FROM rotas r,
-                    jsonb_array_elements(r.passos_array) WITH ORDINALITY AS passo(passo_json, ordem_passo)
+                    UNNEST(CAST(r.passos_array AS JSON[])) WITH ORDINALITY AS passo(passo_json, ordem_passo)
             ),
             dados_jobs as(
                 select  j.client_id,
@@ -4691,9 +4577,10 @@ async def scheduleJobs(
                 JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
                 join places p on p.client_id = j.client_id and p.place_id = j.place_id
                 JOIN simulation s ON s.client_id = t.client_id and s.team_id = t.team_id
-                where j.client_id = :client_id
-                    and s.simulation_id = :simulation_id
-                    and j.job_id IN ({','.join(str(j) for j in vroomJobList)})
+                where j.client_id = $client_id
+                    and s.simulation_id = $simulation_id
+                    AND list_contains($job_list, j.job_id)
+                    --and j.job_id IN ({','.join(str(j) for j in vroomJobList)})
             ),
             dados as(
                 select
@@ -4757,8 +4644,8 @@ async def scheduleJobs(
                     end AS time_distance
                     --q.time_distance
                 from q1 q
-                join dados_jobs j ON j.client_id = :client_id and j.new_job_id = q.job_id
-                join resources r ON r.client_id = :client_id and r.resource_id = q.resource_id
+                join dados_jobs j ON j.client_id = $client_id and j.new_job_id = q.job_id
+                join resources r ON r.client_id = $client_id and r.resource_id = q.resource_id
                 join q1 q_1 on q_1.resource_id = q.resource_id and q_1.stop_type = 'start'
                 join q1 q_2 on q_2.resource_id = q.resource_id and q_2.stop_type = 'end'
                 join q1 q_3 on q_3.resource_id = q.resource_id and q_3.stop_type = 'job' AND q_3.sequence = 2
@@ -4791,8 +4678,8 @@ async def scheduleJobs(
                     q.time_distance_at,
                     q.arrival_at,
                     q.date_at,
-                    json_agg(
-                        json_build_object(
+                    list(
+                        json_object(
                             'client_id', q.client_id,
                             'team_id', q.team_id,
                             'job_id', q.job_id,
@@ -4807,7 +4694,7 @@ async def scheduleJobs(
                             'trade_name', q.trade_name, 
                             'cnpj', q.cnpj,
                             'job_day', q.job_day,      
-                            'geocode_lang', q.geocode_long,
+                            'geocode_long', q.geocode_long,
                             'geocode_lat', q.geocode_lat,
                             'arrival', q.arrival,
                             'service', q.service,
@@ -4824,98 +4711,101 @@ async def scheduleJobs(
                 GROUP BY  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
             )
             select
-                json_agg(
-                    json_build_object(
-                        'client_id', client_id,
-                        'resource_id', resource_id,
-                        'client_resource_id', client_resource_id,
-                        'resource_name', resource_name,
-                        'job_day', job_day,
-                        'geocode_long_from', geocode_long_from,
-                        'geocode_lat_from', geocode_lat_from,
-                        'distance_from', distance_from,
-                        'time_distance_from', time_distance_from,
-                        'arrival_from', arrival_from,
-                        'date_from', date_from,
-                        'geocode_long_at', geocode_long_at,
-                        'geocode_lat_at', geocode_lat_at,
-                        'distance_at', distance_at,
-                        'time_distance_at', time_distance_at,
-                        'arrival_at', arrival_at,
-                        'date_at', date_at,
-                        'total_distance', total_distance,
-                        'total_time_distance', total_time_distance,
-                        'total_jobs', total_jobs,
-                        'jobs', jobs
+                to_json(
+                    list(
+                        json_object(
+                            'client_id', client_id,
+                            'resource_id', resource_id,
+                            'client_resource_id', client_resource_id,
+                            'resource_name', resource_name,
+                            'job_day', job_day,
+                            'geocode_long_from', geocode_long_from,
+                            'geocode_lat_from', geocode_lat_from,
+                            'distance_from', distance_from,
+                            'time_distance_from', time_distance_from,
+                            'arrival_from', arrival_from,
+                            'date_from', date_from,
+                            'geocode_long_at', geocode_long_at,
+                            'geocode_lat_at', geocode_lat_at,
+                            'distance_at', distance_at,
+                            'time_distance_at', time_distance_at,
+                            'arrival_at', arrival_at,
+                            'date_at', date_at,
+                            'total_distance', total_distance,
+                            'total_time_distance', total_time_distance,
+                            'total_jobs', total_jobs,
+                            'jobs', jobs
+                        )
                     )
                 ) AS res
             from grp
-        """)
-        result = await db.execute(smtp, {
+        """
+        result = dbd.execute(stmt, {
             "client_id": clientId,
             "simulation_id": simulationId,
             "vroom_data": vroomResult,
-        })
-        subSubRow = result.mappings().first()
-        if not subSubRow:
-            return
+            "job_list": vroomJobList
+        }).fetchone()[0]
 
-        background_tasks.add_task(logs, clientId=clientId, log='Resultado da Simulacao', logJson=dict(subSubRow))
-        res = subSubRow['res']
+        if not result:
+            return []
 
-        rep_json = json.dumps(res)
+        asyncio.create_task(logs(clientId=clientId, log=f'Resultado da simulação {simulationId}', logJson=result))
+        # print(type(result))
+        rep_json = result
+        # print(f"\nJSON a ser salvo: {rep_json}")
         if len(resources) == 1:
             logger.warning('Entrou aqui no update...')
-            smtp = text(f"""
+            smtp = """
                 UPDATE simulation
-                SET json_dado = 
-                    -- 1. Monta um array com todos os itens, EXCETO o ID 3 (remove o antigo se existir)
-                    COALESCE(
-                        (
-                            SELECT jsonb_agg(elem)
-                            FROM jsonb_array_elements(json_dado) AS elem
-                            WHERE (elem->>'resource_id')::INT NOT IN ({','.join(str(j) for j in resources)})
-                        ), 
-                        '[]'::jsonb -- Garante que não retorne NULL caso o array fique vazio
-                    ) 
-                    
-                    || -- Operador de concatenação de JSONB
-                    
-                    -- 2. Adiciona o NOVO nó inteiro (dentro de colchetes para mesclar no array principal)
-                    :json_data
-                    ,modified_by = 'system'
-                    ,modified_date  = NOW()
+                SET json_dado = to_json(
+                    list_concat(
+                        -- 1. Monta uma lista com todos os itens, EXCETO os IDs especificados
+                        COALESCE(
+                            (
+                                SELECT list(elem)
+                                FROM unnest(from_json(json_dado, '["JSON"]')) AS t(elem)
+                                WHERE NOT list_contains($resources, CAST(json_extract_string(elem, '$.resource_id') AS INT))
+                                
+                            ), 
+                            [] -- Lista vazia caso não sobre nenhum elemento
+                        ),
+                        
+                        -- 2. Concatena a lista antiga filtrada com a nova lista (passada em :json_data)
+                        from_json($json_data, '["JSON"]')
+                    )
+                )
+                ,modified_by = 'system'
+                ,modified_date = CURRENT_TIMESTAMP
 
-                WHERE  client_id = :client_id and simulation_id = :simulation_id
-                RETURNING
-                    json_dado
-                    """)
-            
+                WHERE client_id = $client_id AND simulation_id = $simulation_id
+                RETURNING json_dado
+            """
+            result = dbd.execute(smtp, {
+                "client_id": clientId,
+                "simulation_id": simulationId,
+                "json_data": rep_json,
+                "resources": resources  # Passa o único ID de recurso diretamente
+            }).fetchone()[0]
         else:
             logger.warning('Entrou aqui no MERGE...')   
-            smtp = text(f"""
-                MERGE INTO simulation u
-                USING (SELECT CAST(:json_data AS jsonb) as rep) as t
-                ON ( client_id = :client_id and simulation_id = :simulation_id)
-                WHEN MATCHED THEN
-                UPDATE SET 
-                    json_dado = t.rep
-                    ,modified_by = 'system'
-                    ,modified_date  = NOW()
-                RETURNING
-                    json_dado
-            """)
-        
-        parametros = {
-            "client_id": clientId,
-            "simulation_id": simulationId,
-            "json_data": rep_json
-        }
-        result = await db.execute(smtp, parametros)
-        await db.commit()
-        for row in result:
-            return row.json_dado
+            smtp = """
+                UPDATE simulation
+                SET 
+                    json_dado = CAST($json_data AS JSON),
+                    modified_by = 'system',
+                    modified_date = CURRENT_TIMESTAMP
+                WHERE client_id = $client_id AND simulation_id = $simulation_id
+                RETURNING json_dado
+            """
+            result = dbd.execute(smtp, {
+                    "client_id": clientId,
+                    "simulation_id": simulationId,
+                    "json_data": rep_json
+                }).fetchone()[0]
+
         logger.warning(f'Reports finalizados!')
+        return result
 
     res = []
     if perResource:
@@ -4933,6 +4823,6 @@ async def scheduleJobs(
             res = await calc_rote()
     else:
         res = await calc_rote()
-
-    return res
+    # print(type(res), res)
+    return json.loads(res) if res else []
     
