@@ -119,6 +119,42 @@ class SimulationComparisonRequest(BaseModel):
 class ClearScheduleJobsRequest(BaseModel):
     resource_id: int
     simulation_id: int
+class ScheduleResponse(BaseModel):
+    schedule_id: int
+    team_id: int
+    schedule_start_date: date
+    schedule_start_time: time
+    status: str
+    update_tasks: int
+    next_schedule_date: datetime
+    frequency: str
+    type_resources: str
+    resources: Optional[Any] = None
+
+    class Config:
+        from_attributes = True
+
+class ScheduleCreateRequest(BaseModel):
+    team_id: int
+    schedule_start_date: date
+    schedule_start_time: time
+    next_schedule_date: datetime
+    frequency: str = "DAILY"
+    type_resources: str = "A"
+    update_tasks: int = 0
+    resources: Optional[Any] = None
+
+class ScheduleUpdateRequest(BaseModel):
+    team_id: Optional[int] = None
+    schedule_start_date: Optional[date] = None
+    schedule_start_time: Optional[time] = None
+    status: Optional[str] = None
+    next_schedule_date: Optional[datetime] = None
+    frequency: Optional[str] = None
+    type_resources: Optional[str] = None
+    update_tasks: Optional[int] = None
+    resources: Optional[Any] = None
+
 class ViewResourceWindowsResponse(BaseModel):
     rw_id: int
     uid: UUID4
