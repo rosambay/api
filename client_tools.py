@@ -729,71 +729,52 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
 # Recuperando o valor
 
         app_params_response = await client.execute_query(f"""
-            SELECT a.*, 
-                  MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap,
-                  MIN(created_dttm) OVER (PARTITION BY 1) AS first_snap 
-            FROM ( 
-                SELECT TOP 2000
-                    t.request_id,
-                    t.contr_type,
-                    t.task_id, 
-                    t.team_id,
+            
+                SELECT TOP 10
+                    CONCAT(t.request_id,'|',t.task_id) AS client_job_id,
+                    t.team_id client_team_id,
                     t.desc_team,
-                    t.person_id,
-                    t.task_type,
-                    t.desc_task_type,
-                    t.task_status, 
-                    case when mmd.message_text is null then t.desc_task_status else mmd.message_text end desc_task_status,
-                    t.item_style_id, 
-                    t.place_id,
+                    CONVERT(VARCHAR(19), CAST(t.team_modified_dttm AS DATETIME2), 120) team_modified_date,
+                    t.person_id AS client_resource_id,
+                    concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
+                    CONVERT(VARCHAR(19), CAST(p.modified_dttm AS DATETIME2), 120) AS resource_modified_date,                                         
+                    t.task_status AS client_status_id, 
+                    case when mmd.message_text is null then t.desc_task_status else mmd.message_text end desc_status,
+                    t.item_style_id client_style_id, 
+                    CONVERT(VARCHAR(19), CAST(t.task_status_modified_dttm AS DATETIME2), 120) status_modified_date,
+                    t.task_type AS client_type_id,
+                    t.desc_task_type AS desc_type,
+                    CONVERT(VARCHAR(19), CAST(t.task_type_modified_dttm AS DATETIME2), 120) type_modified_date,
+                    t.place_id client_place_id,
                     t.trade_name,
                     t.cnpj,
-                    t.created_dttm, 
-                    t.modified_dttm,
-                    COALESCE(t.work_duration,0) * 60 AS work_duration,
-                    t.plan_start_dttm,
-                    t.plan_end_dttm,
-                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_task_dur_min,
-                    t.actual_start_dttm,
-                    t.actual_end_dttm,
-                    t.sla,
-                    t.address_id,
-                    t.geocode_lat, 
-                    t.geocode_long,
+                    CONVERT(VARCHAR(19), CAST(t.place_modified_dttm AS DATETIME2), 120) place_modified_date,
+                    t.address_id client_address_id,
                     t.address,
                     t.city,
-                    t.state_prov, 
-                    t.zippost,
-                    t.address_modified_dttm,
-                    t.team_modified_dttm,
-                    t.place_modified_dttm,
-                    t.task_type_modified_dttm,
-                    t.task_status_modified_dttm,
-                    pp.pp_person_id,
-                    pp.pp_actual_start_dttm,
-                    pp.pp_actual_end_dttm,
-                    pp.pt_task_id,
-                    pp.pt_actual_start_dttm,
-                    pp.pt_actual_end_dttm,
-                    pp.pt_geocode_lat,
-                    pp.pt_geocode_long,
-                    concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
-                    p.geocode_lat as resource_geocode_lat, 
-                    p.geocode_long as resource_geocode_long, 
-                    pg.geocode_lat_from,
-                    pg.geocode_long_from, 
-                    pg.geocode_lat_at, 
-                    pg.geocode_long_at,
-                    CASE WHEN p.work_status = 'OFF SHIFT' THEN 1 ELSE 0 END as work_status,
-                    p.modified_dttm AS resource_modified_dttm                   
-               FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
-               JOIN dbo.c_task_routes_preview_task_vw pp on pp.task_id = t.task_id
-                LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
-                LEFT JOIN dbo.c_person_geocode_vw pg ON p.person_id = pg.person_id
+                    t.state_prov state, 
+                    t.zippost zip_code,
+                    t.geocode_lat, 
+                    t.geocode_long,
+                    CONVERT(VARCHAR(19), CAST(t.address_modified_dttm AS DATETIME2), 120) address_modified_date,
+                    CONVERT(VARCHAR(19), CAST(t.plan_start_dttm AS DATETIME2), 120) plan_start_date,
+                    CONVERT(VARCHAR(19), CAST(t.plan_end_dttm AS DATETIME2), 120) plan_end_date,
+                    CONVERT(VARCHAR(19), CAST(t.actual_start_dttm AS DATETIME2), 120) actual_start_date,
+                    CONVERT(VARCHAR(19), CAST(t.actual_end_dttm AS DATETIME2), 120) actual_end_date,
+                    COALESCE(t.work_duration,0) * 60 AS real_time_service,
+                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_time_service,
+                    CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) limit_start_date,
+                    t.sla limit_end_date,
+                    t.contr_type as priority,
+                    CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) created_date, 
+                    CONVERT(VARCHAR(19), CAST(t.modified_dttm AS DATETIME2), 120) modified_date
+
+                FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
+                    LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
                     LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
-						       WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
+			    WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
                  ORDER BY t.modified_dttm ASC 
-            ) AS a
+            
             """)
         # WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
         await client.close()
@@ -818,10 +799,13 @@ async def getStyleMetrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-            select item_style_id, font_weight, background, foreground ,modified_dttm, max(modified_dttm)  OVER (PARTITION BY 1)  last_snap
+            select  item_style_id client_style_id, 
+                    COALESCE(background, '#FFFFFF') AS background,
+                    COALESCE(foreground, '#000000') AS foreground,
+                    CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) AS modified_date
               from METRIX_ITEM_STYLE_VIEW
             where (modified_dttm >= CAST('{dateTime}' AS datetime))
-            order by modified_dttm desc
+            order by modified_dttm ASC
             """)
         await client.close()
 
