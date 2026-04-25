@@ -214,14 +214,17 @@ class Resources(Base):
     resource_id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
     client_resource_id = Column(String(32), nullable=False)
-    description = Column(String(128), nullable=False)    
-    actual_geocode_lat = Column(String(32), nullable=True)
-    actual_geocode_long = Column(String(32), nullable=True)    
-    geocode_lat_from = Column(String(32), nullable=True)
-    geocode_long_from = Column(String(32), nullable=True)
-    geocode_lat_at = Column(String(32), nullable=True)
-    geocode_long_at = Column(String(32), nullable=True)
-    fl_off_shift = Column(Integer, nullable=False, server_default=text("0"))
+    description = Column(String(128), nullable=False)
+    resource_status_id = Column(Integer, nullable=False)
+    geocode_lat_actual = Column(String(32), nullable=True)
+    geocode_long_actual = Column(String(32), nullable=True)    
+    geocode_lat_start = Column(String(32), nullable=True)
+    geocode_long_start = Column(String(32), nullable=True)
+    geocode_lat_end = Column(String(32), nullable=True)
+    geocode_long_end = Column(String(32), nullable=True)
+    off_shift_flag = Column(Integer, nullable=False, server_default=text("0"))
+    off_shift_start_time = Column(Time, nullable=False, server_default=text("'07:00:00'"))
+    off_shift_end_time = Column(Time, nullable=False, server_default=text("'22:00:00'"))
     logged_in = Column(DateTime, nullable=True)
     logged_out = Column(DateTime, nullable=True)
     time_setup = Column(Integer, nullable=True)
@@ -241,6 +244,24 @@ class Resources(Base):
             Index('idx_resources_03', 'modified_date_login','client_id')
         )
 
+class ResourceStatus(Base):
+    __tablename__ = "resource_status"
+
+    uid = Column(UUID(as_uuid=True), unique=True, server_default=text("gen_random_uuid()"))
+    client_id = Column(Integer, ForeignKey("clients.client_id"), primary_key=True, nullable=False)
+    resource_status_id = Column(Integer, primary_key=True, autoincrement=True)
+    client_resource_status_id = Column(String(32), nullable=False)
+    description  = Column(String(128), nullable=False)
+    internal_code_status = Column(String(6), nullable=True) #A-Agendado, B-Em Andamento, C-Concluído, D-Cancelado
+    created_by = Column(String(32), nullable=False)
+    created_date = Column(DateTime, nullable=False)
+    modified_by = Column(String(32), nullable=False)
+    modified_date = Column(DateTime, nullable=False)
+    __table_args__ = (
+            UniqueConstraint('client_id','client_resource_status_id', name='uk_resource_status'),
+            Index('idx_resource_status_01', 'modified_date','client_id')
+        )
+    
 class ResourceWindows(Base):
     __tablename__ = "resource_windows"
 

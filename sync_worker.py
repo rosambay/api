@@ -25,6 +25,24 @@ def oneHour(dateTime: str):
     nova_data_obj = data_obj - timedelta(hours=1)
     return nova_data_obj.strftime('%Y-%m-%d %H:%M:%S')
 
+async def nofifyWebSocket(r, type, data):
+    async for chave in r.scan_iter("session:*"):
+        session = chave.split(':')[1]
+        result =  await r.get(chave)
+        if result:
+            for x in json.loads(result):
+                if x['team_id'] == data.registro_json['team_id']:
+                    logger.debug(f"Enviando atualização para sessão {session} do WebSocket - Equipe: {data.registro_json['team_id']}")
+                    chave_queue = f"notify:{session}:queue"
+                    payload = {
+                        "type": type,
+                        "action": data.merge_action,
+                        "dados": data.registro_json or {}
+                    }
+                    payload_json = json.dumps(payload)
+                    await r.rpush(chave_queue, payload_json)
+                    await r.expire(chave_queue, 3600)
+                    await r.publish(f"notify:{session}:notify", "check_queue")
 
 async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
     stmt = text(f"""
@@ -3245,26 +3263,6 @@ async def getJobs(r):
       except Exception as e:
                 logger.error(f"[getJobs] Erro ao processar postgres: {e}")
     return
-
-async def nofifyWebSocket(r, type, data):
-    async for chave in r.scan_iter("session:*"):
-        session = chave.split(':')[1]
-        result =  await r.get(chave)
-        if result:
-            for x in json.loads(result):
-                if x['team_id'] == data.registro_json['team_id']:
-                    logger.debug(f"Enviando atualização para sessão {session} do WebSocket - Equipe: {data.registro_json['team_id']}")
-                    chave_queue = f"notify:{session}:queue"
-                    payload = {
-                        "type": type,
-                        "action": data.merge_action,
-                        "dados": data.registro_json or {}
-                    }
-                    payload_json = json.dumps(payload)
-                    await r.rpush(chave_queue, payload_json)
-                    await r.expire(chave_queue, 3600)
-                    await r.publish(f"notify:{session}:notify", "check_queue")
-
     
 async def getPriority(r):
     logger.warning("[getPriority] Entrou atualização das Janelas de Recursos ...")

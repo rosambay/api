@@ -28,12 +28,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text
 from datetime import datetime, timedelta, date
-
-import database
+from database import get_db, SessionLocal, engine, Base
 import models
 import redis_client
 from auth import verify_password
 from config import settings
+from contextlib import asynccontextmanager
+import integration_schemas as schemas
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -44,7 +45,26 @@ def serializador_customizado(obj):
     # Se for outro tipo desconhecido, gera erro (comportamento padrão)
     raise TypeError(f"Tipo {type(obj)} não é serializável")
 
-app = FastAPI(title="Routes Integration API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        
+        # await conn.run_sync(Base.metadata.drop_all)
+        # logger.info("Tabelas do banco dropadas com sucesso!")
+        # await r.flushall()
+        # logger.info("Cache Redis limpo com sucesso!")
+
+        await conn.run_sync(Base.metadata.create_all)
+        logger.info("Tabelas do banco verificadas/criadas com sucesso!")
+
+    r = redis_client.get_redis()
+    await r.flushall()
+    
+    yield
+
+
+app = FastAPI(title="Routes Integration API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,88 +77,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 _INTEGRATION_TOKEN_EXPIRE = 60 * 24  # 24 horas
 
-# ─── Schemas ─────────────────────────────────────────────────────────────────
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int = _INTEGRATION_TOKEN_EXPIRE * 60
-
-
-class StyleUpsertRequest(BaseModel):
-    client_style_id: str = Field(..., description="ID do Estilo no sistema do cliente")
-    background: str = Field(..., description="Cor do fundo")
-    foreground: str = Field(..., description="Cor do texto")
-    modified_date: datetime = Field(..., description="Data/hora de última modificação do estilo")
-
-class JobUpsertRequest(BaseModel):
-    client_job_id: str = Field(..., description="ID do tarefa no sistema do cliente")
-    client_team_id: str = Field(..., description="ID da equipe da tarefa no sistema do cliente")
-    desc_team: str = Field(..., description="Descrição da equipe da tarefa no sistema do cliente")
-    team_modified_date: datetime = Field(..., description="Data/hora de última modificação da equipe, se houver, da tarefa no sistema do cliente")
-    client_resource_id: Optional[str] = Field(None, description="ID do recurso, se houver, da tarefa no sistema do cliente")
-    resource_name: Optional[str] = Field(None, description="Nome do recurso, se houver, da tarefa no sistema do cliente")
-    resource_modified_date: Optional[datetime] = Field(None, description="Data/hora de última modificação do recurso, se houver, da tarefa no sistema do cliente")
-    client_status_id: str = Field(..., description="ID da situação (status) da tarefa no sistema do cliente")
-    desc_status: str = Field(..., description="Descrição da situação (status) da tarefa no sistema do cliente")
-    client_style_id: Optional[str] = Field(None, description="ID do estilo (style) da tarefa no sistema do cliente")
-    status_modified_date: datetime = Field(..., description="Data/hora de última modificação da situação (status) da tarefa no sistema do cliente")
-    client_type_id: str = Field(..., description="ID do tipo de tarefa no sistema do cliente")
-    desc_type: str = Field(..., description="Descrição do tipo de tarefa no sistema do cliente")
-    type_modified_date: datetime = Field(..., description="Data/hora de última modificação do tipo da tarefa no sistema do cliente")    
-    client_place_id: str = Field(..., description="ID do local da tarefa no sistema do cliente")
-    trade_name: str = Field(..., description="Nome comercial do local da tarefa, se houver, no sistema do cliente")
-    cnpj: Optional[str] = Field(None, description="CNPJ do local da tarefa, se houver, no sistema do cliente")
-    place_modified_date: datetime = Field(..., description="Data/hora de última modificação do local da tarefa no sistema do cliente")
-    client_address_id: str = Field(..., description="ID do endereço da tarefa no sistema do cliente")
-    address: str = Field(..., description="Endereço completo da tarefa no sistema do cliente")  
-    city: str = Field(..., description="Cidade do local da tarefa, se houver, no sistema do cliente")
-    state: str = Field(..., description="Estado do local da tarefa, se houver, no sistema do cliente")
-    zip_code: Optional[str] = Field(None, description="CEP do local da tarefa, se houver, no sistema do cliente")
-    geocode_lat: Optional[str] = Field(None, description="Latitude do local da tarefa, se houver, no sistema do cliente")
-    geocode_long: Optional[str] = Field(None, description="Longitude do local da tarefa, se houver, no sistema do cliente")
-    address_modified_date: datetime = Field(..., description="Data/hora de última modificação do endereço da tarefa no sistema do cliente")
-    plan_start_date: datetime = Field(..., description="Data/hora planejada de início da tarefa no sistema do cliente")
-    plan_end_date: datetime = Field(..., description="Data/hora planejada de término da tarefa no sistema do cliente")
-    actual_start_date: Optional[datetime] = Field(None, description="Data/hora real de início da tarefa, se houver, no sistema do cliente")
-    actual_end_date: Optional[datetime] = Field(None, description="Data/hora real de término da tarefa, se houver, no sistema do cliente")
-    real_time_service: Optional[int] = Field(None, description="Tempo de serviço em segundos da tarefa, se houver, no sistema do cliente")
-    plan_time_service: Optional[int] = Field(None, description="Tempo de serviço planejado em segundos da tarefa, se houver, no sistema do cliente")    
-    limit_start_date: Optional[datetime] = Field(None, description="Data/hora limite de início da tarefa, se houver, no sistema do cliente")
-    limit_end_date: Optional[datetime] = Field(None, description="Data/hora limite de término da tarefa, se houver, no sistema do cliente")
-    priority: Optional[str] = Field(None, description="Prioridade da tarefa, se houver, no sistema do cliente")
-    time_setup: Optional[int] = Field(None, description="Tempo de configuração em segundos da tarefa, se houver, no sistema do cliente")
-    time_overlap: Optional[int] = Field(None, description="Tempo de sobreposição em segundos da tarefa, se houver, no sistema do cliente")
-    distance: Optional[int] = Field(None, description="Distância em metros da tarefa, se houver, no sistema do cliente")
-    time_distance: Optional[int] = Field(None, description="Tempo de deslocamento em segundos da tarefa, se houver, no sistema do cliente")
-    complements: Optional[Any] = None
-    created_date: datetime = Field(..., description="Data/hora da criação da tarefa")
-    modified_date: datetime = Field(..., description="Data/hora da ultima atualização da tarefa")
-
-
-class UpsertResponse(BaseModel):
-    id: int
-    client_id: str
-    action: str  # "INSERT" | "UPDATE"
-
-    class Config:
-        from_attributes = True
-
-
-class UpsertError(BaseModel):
-    type: str
-    id: str
-    message: str
-
-
-class BatchResponse(BaseModel):
-    processed: int
-    inserted: int
-    updated: int
-    results: list[UpsertResponse]
-    errors: list[UpsertError]
-
-
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 def _create_integration_token(client_id: int, api_key_id: str) -> str:
@@ -149,7 +87,7 @@ def _create_integration_token(client_id: int, api_key_id: str) -> str:
 
 async def get_integration_client(
     token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(database.get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> dict:
     exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -256,7 +194,7 @@ async def getSnapTime(r, client_id):
             "job_types" : dateTime,
             "job_status" : dateTime,
         }
-        await r.set(clientKey,json.dumps(payload))
+        await r.set(clientKey,payload)
     return payload
 
 async def setSnapTime(r, client_id, snap, snapTime):
@@ -269,16 +207,15 @@ async def setSnapTime(r, client_id, snap, snapTime):
     payload_dict[f'{snap}'] = snapTime
     await r.set(clientKey,json.dumps(payload_dict))
     return
-    
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
-@app.post("/token", response_model=TokenResponse)
+@app.post("/token", response_model=schemas.TokenResponse)
 async def token(
     client_id: str = Form(...),
     client_secret: str = Form(...),
     grant_type: str = Form(default="client_credentials"),
-    db: AsyncSession = Depends(database.get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     if grant_type != "client_credentials":
         raise HTTPException(status_code=400, detail="grant_type deve ser 'client_credentials'")
@@ -298,7 +235,7 @@ async def token(
 
     token_str = _create_integration_token(cred.client_id, cred.api_key_id)
     logger.info(f"[integration] Token emitido para api_key_id={client_id} client_id={cred.client_id}")
-    return TokenResponse(access_token=token_str)
+    return schemas.TokenResponse(access_token=token_str)
 
 @app.get("/snaps", status_code=200)
 async def get_snaps(
@@ -308,19 +245,19 @@ async def get_snaps(
     client_id = current["clientId"]
     snapkey   = f"snap_time:{client_id}"
     payload = await getSnapTime(r,client_id)
+    print(type(payload))
     return payload
 
-
-@app.post("/jobs", response_model=BatchResponse, status_code=200)
+@app.post("/jobs", response_model=schemas.BatchResponse, status_code=200)
 async def upsert_jobs(
-    body: list[JobUpsertRequest],
-    db: AsyncSession = Depends(database.get_db),
+    body: list[schemas.JobUpsertRequest],
+    db: AsyncSession = Depends(get_db),
     r: Redis = Depends(redis_client.get_redis),
     duck: duckdb.DuckDBPyConnection = Depends(get_duckdb),
     current: dict = Depends(get_integration_client),
 ):
     if not body:
-        return BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
+        return schemas.BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
 
     client_id = current["clientId"]
     api_tag   = f"API:{current['apiKeyId'][:8]}"
@@ -337,9 +274,10 @@ async def upsert_jobs(
         SELECT DISTINCT 
             client_team_id, 
             desc_team AS team_name,
-            team_modified_date AS modified_date 
+            team_modified_date AS modified_date,
+            max(team_modified_date)  OVER (PARTITION BY 1)  last_snap  
          FROM JOBS_TEMP
-        ORDER BY team_modified_date
+        ORDER BY team_modified_date ASC
     """).pl().to_dicts()
     
     dados_json = json.dumps(result, default=serializador_customizado)
@@ -364,40 +302,41 @@ async def upsert_jobs(
     for row in result:
         logger.info(f"ID: {row.team_id} | Ação Team realizada: {row.merge_action}")
 
-    ## resources
-    result = duck.execute("""
-        SELECT DISTINCT 
-            client_resource_id, 
-            resource_name,
-            resource_modified_date AS modified_date 
-         FROM JOBS_TEMP
-        WHERE client_resource_id IS NOT NULL
-        order by resource_modified_date
-    """).pl().to_dicts()
+    # ## resources
+    # result = duck.execute("""
+    #     SELECT DISTINCT 
+    #         client_resource_id, 
+    #         resource_name,
+    #         resource_modified_date AS modified_date,
+    #         max(resource_modified_date)  OVER (PARTITION BY 1)  last_snap 
+    #      FROM JOBS_TEMP
+    #     WHERE client_resource_id IS NOT NULL
+    #     order by resource_modified_date ASC
+    # """).pl().to_dicts()
 
-    if result:
-        dados_json = json.dumps(result, default=serializador_customizado)
+    # if result:
+    #     dados_json = json.dumps(result, default=serializador_customizado)
 
-        stmt = text(f"""
-            MERGE INTO resources AS u
-            USING (
-                SELECT x.* 
-                FROM jsonb_to_recordset(:dados_json)
-                AS x( client_resource_id text,
-                        resource_name text,
-                        modified_date TIMESTAMP
-                    ) 
-                ) AS t
-            ON u.client_id = :client_id AND u.client_resource_id = t.client_resource_id
-            WHEN NOT MATCHED THEN
-                INSERT (client_id,client_resource_id, description, created_by, created_date, modified_by, modified_date)
-                VALUES (:client_id, t.client_resource_id, t.resource_name, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date)
-            RETURNING
-                u.resource_id, merge_action(), to_jsonb(u) AS registro_json
-        """)
-        result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
-        for row in result:
-            logger.info(f"ID: {row.resource_id} | Ação Resource realizada: {row.merge_action}")
+    #     stmt = text(f"""
+    #         MERGE INTO resources AS u
+    #         USING (
+    #             SELECT x.* 
+    #             FROM jsonb_to_recordset(:dados_json)
+    #             AS x( client_resource_id text,
+    #                     resource_name text,
+    #                     modified_date TIMESTAMP
+    #                 ) 
+    #             ) AS t
+    #         ON u.client_id = :client_id AND u.client_resource_id = t.client_resource_id
+    #         WHEN NOT MATCHED THEN
+    #             INSERT (client_id,client_resource_id, description, created_by, created_date, modified_by, modified_date)
+    #             VALUES (:client_id, t.client_resource_id, t.resource_name, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date)
+    #         RETURNING
+    #             u.resource_id, merge_action(), to_jsonb(u) AS registro_json
+    #     """)
+    #     result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+    #     for row in result:
+    #         logger.info(f"ID: {row.resource_id} | Ação Resource realizada: {row.merge_action}")
     
     ## status da tarefa
     result = duck.execute("""
@@ -405,9 +344,10 @@ async def upsert_jobs(
             client_status_id, 
             desc_status,
             client_style_id, 
-            status_modified_date AS modified_date 
+            status_modified_date AS modified_date,
+            max(status_modified_date)  OVER (PARTITION BY 1)  last_snap  
          FROM JOBS_TEMP
-        ORDER BY status_modified_date
+        ORDER BY status_modified_date ASC
     """).pl().to_dicts()
 
     if result:
@@ -440,9 +380,10 @@ async def upsert_jobs(
         SELECT DISTINCT 
             client_type_id,
             desc_type,
-            type_modified_date AS modified_date 
+            type_modified_date AS modified_date,
+            max(type_modified_date)  OVER (PARTITION BY 1)  last_snap  
          FROM JOBS_TEMP
-        ORDER BY type_modified_date
+        ORDER BY type_modified_date ASC
     """).pl().to_dicts()
 
     if result:
@@ -473,9 +414,10 @@ async def upsert_jobs(
             client_place_id, 
             trade_name,
             cnpj,              
-            place_modified_date AS modified_date 
+            place_modified_date AS modified_date,
+            max(place_modified_date)  OVER (PARTITION BY 1)  last_snap  
          FROM JOBS_TEMP
-        ORDER BY place_modified_date
+        ORDER BY place_modified_date ASC
     """).pl().to_dicts()
 
     if result:
@@ -511,12 +453,14 @@ async def upsert_jobs(
             zip_code,
             geocode_lat,
             geocode_long,
-            address_modified_date AS modified_date 
+            address_modified_date AS modified_date,
+            max(address_modified_date)  OVER (PARTITION BY 1)  last_snap 
          FROM JOBS_TEMP
         ORDER BY address_modified_date
     """).pl().to_dicts()
 
     if result:
+        last_snap = result[0]['last_snap'].strftime('%Y-%m-%d %H:%M:%S')
         for row in result:
             try:
                 client_address_id = row['client_address_id']
@@ -570,7 +514,7 @@ async def upsert_jobs(
 
     if result:
         last_snap = result[0]['last_snap'].strftime('%Y-%m-%d %H:%M:%S')
-        await setSnapTime(r,client_id, 'jobs', last_snap)
+        
         dados_json = json.dumps(result, default=serializador_customizado)
 
         stmt = text(f"""
@@ -660,28 +604,33 @@ async def upsert_jobs(
                 contador_insert += 1
             else:
                 contador_update += 1
+
+        await setSnapTime(r,client_id, 'jobs', last_snap)
             # logger.info(f"ID: {row.job_id} | Ação JOB realizada: {row.merge_action}")
 
 
     await db.rollback()
 
-    return BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)
-    
+    return schemas.BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)
 
-@app.post("/styles", response_model=BatchResponse, status_code=200)
+@app.post("/styles", response_model=schemas.BatchResponse, status_code=200)
 async def upsert_styles(
-    body: list[StyleUpsertRequest],
-    db: AsyncSession = Depends(database.get_db),
+    body: list[schemas.StyleUpsertRequest],
+    db: AsyncSession = Depends(get_db),
     r: Redis = Depends(redis_client.get_redis),
     duck: duckdb.DuckDBPyConnection = Depends(get_duckdb),
     current: dict = Depends(get_integration_client),
 ):
     if not body:
-        return BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
+        return schemas.BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
 
     client_id = current["clientId"]
 
     inconsistencies = []
+    contador = 0
+    contador_insert = 0
+    contador_update = 0
+
     df_dados = pl.DataFrame(body, infer_schema_length=None)
 
     duck.execute("CREATE TEMP TABLE STYLES_TEMP AS SELECT * FROM df_dados")
@@ -690,49 +639,364 @@ async def upsert_styles(
         SELECT 
             client_style_id, 
             background,
-            foreground
-            modified_date
+            foreground,
+            modified_date,
+            max(modified_date)  OVER (PARTITION BY 1)  last_snap  
          FROM STYLES_TEMP
         ORDER BY modified_date
     """).pl().to_dicts()
-    
-    dados_json = json.dumps(result, default=serializador_customizado)
-    
-    stmt = text(f"""
-        MERGE INTO styles AS u
-            USING (SELECT x.*
-                    FROM jsonb_to_recordset(:dados_json)
-                    AS x(   client_style_id text,
-                            background text,
-                            foreground text,
-                            modified_date TIMESTAMP
-                        )
-                    ) AS t
-            ON u.client_id = :client_id AND u.client_style_id = t.client_style_id
-            WHEN MATCHED AND (
-                            u.background IS DISTINCT FROM t.background
-                        OR u.foreground IS DISTINCT FROM t.foreground
-                        ) and u.modified_date <= t.modified_date THEN
-                UPDATE SET background = t.background
-                    ,foreground = t.foreground
-                    ,modified_by = 'INTEGRATION'
-                    ,modified_date = t.modified_date
-            WHEN NOT MATCHED THEN
-                INSERT (client_id, client_style_id, background, foreground, created_by, created_date, modified_by, modified_date)
-                VALUES (:client_id, t.client_style_id, t.background, t.foreground,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date)
-            RETURNING
-                u.style_id, merge_action(), to_jsonb(u) AS registro_json
-        """)
-    result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+
+    if result:
+        last_snap = result[0]['last_snap'].strftime('%Y-%m-%d %H:%M:%S')
+
+        dados_json = json.dumps(result, default=serializador_customizado)
+        
+        stmt = text(f"""
+            MERGE INTO styles AS u
+                USING (SELECT x.*
+                        FROM jsonb_to_recordset(:dados_json)
+                        AS x(   client_style_id text,
+                                background text,
+                                foreground text,
+                                modified_date TIMESTAMP
+                            )
+                        ) AS t
+                ON u.client_id = :client_id AND u.client_style_id = t.client_style_id
+                WHEN MATCHED AND (
+                                u.background IS DISTINCT FROM t.background
+                            OR u.foreground IS DISTINCT FROM t.foreground
+                            ) and u.modified_date <= t.modified_date THEN
+                    UPDATE SET background = t.background
+                        ,foreground = t.foreground
+                        ,modified_by = 'INTEGRATION'
+                        ,modified_date = t.modified_date
+                WHEN NOT MATCHED THEN
+                    INSERT (client_id, client_style_id, background, foreground, created_by, created_date, modified_by, modified_date)
+                    VALUES (:client_id, t.client_style_id, t.background, t.foreground,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date)
+                RETURNING
+                    u.style_id, merge_action(), to_jsonb(u) AS registro_json
+            """)
+        result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+        await db.commit()
+        
+        for row in result:
+            if row.merge_action == 'INSERT':
+                contador_insert += 1
+            else:
+                contador_update += 1
+
+        await setSnapTime(r,client_id, 'styles', last_snap)
+
+
+    return schemas.BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)
+
+
+@app.post("/resources", response_model=schemas.BatchResponse, status_code=200)
+async def upsert_resources(
+    body: list[schemas.ResourcesUpsertRequest],
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(redis_client.get_redis),
+    duck: duckdb.DuckDBPyConnection = Depends(get_duckdb),
+    current: dict = Depends(get_integration_client),
+):
+    if not body:
+        return schemas.BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
+
+    client_id = current["clientId"]
+
+    inconsistencies = []
+    df_dados = pl.DataFrame(
+        body, 
+        infer_schema_length=None
+    )
+
     contador = 0
     contador_insert = 0
     contador_update = 0
-    for row in result:
-        if row.merge_action == 'INSERT':
-            contador_insert += 1
-        else:
-            contador_update += 1
 
-    await db.rollback()
+    duck.execute("CREATE TEMP TABLE RESOURCES_TEMP AS SELECT * FROM df_dados")
+    ## Criar os status dos recursos
+    result = duck.execute("""
+        SELECT DISTINCT 
+            client_status_id as client_resource_status_id, 
+            desc_status
+         FROM RESOURCES_TEMP
+        ORDER BY client_status_id ASC
+    """).pl().to_dicts()
+    
+    if result:
+        
+        dados_json = json.dumps(result, default=serializador_customizado)
+        
+        stmt = text(f"""
+            MERGE INTO resource_status AS u
+            USING (
+                SELECT x.* FROM jsonb_to_recordset(:dados_json)
+                AS x(   client_resource_status_id text,
+                        desc_status text
+                ) ) AS t
+            ON u.client_id = :client_id AND u.client_resource_status_id = t.client_resource_status_id
+            WHEN NOT MATCHED THEN
+                INSERT (client_id,client_resource_status_id, description, created_by, created_date, modified_by, modified_date)
+                VALUES (:client_id, t.client_resource_status_id, t.desc_status, 'INTEGRATION', NOW(), 'INTEGRATION', NOW())
+            RETURNING
+                u.resource_status_id, merge_action(), to_jsonb(u) AS registro_json
+            """)
+        result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+        # await db.commit()
+        for row in result:
+            logger.info(f"ID: {row.resource_status_id} | Ação Status do Recurso realizada: {row.merge_action}")
 
-    return BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)
+
+    result = duck.execute("""
+        SELECT 
+            client_resource_id, 
+            resource_name,
+            client_status_id,
+            desc_status,
+            off_shift_flag,
+            off_shift_start_time,
+            off_shift_end_time,
+            geocode_lat_actual, 
+            geocode_long_actual,
+            geocode_lat_start,
+            geocode_long_start,
+            geocode_lat_end,
+            geocode_long_end,
+            modified_date,
+            max(modified_date)  OVER (PARTITION BY 1)  last_snap  
+         FROM RESOURCES_TEMP
+        ORDER BY modified_date
+    """).pl().to_dicts()
+    
+    if result:
+        for row in result:
+            client_resource_id = row['client_resource_id']
+            geocode_lat_actual = row['geocode_lat_actual']
+            geocode_long_actual = row['geocode_long_actual']
+            geocode_lat_start = row['geocode_lat_start']
+            geocode_long_start = row['geocode_long_start']
+            geocode_lat_end = row['geocode_lat_end']
+            geocode_long_end = row['geocode_long_end']
+            try:
+                if geocode_lat_actual and geocode_long_actual:
+                    lat = float(geocode_lat_actual)
+                    long = float(geocode_long_actual)
+                    if not (-40 <= lat <= 10 and -80 <= long <= -30):
+                        raise ValueError
+            except ValueError:
+                inconsistencies.append({"type":"WARNING", "id":client_resource_id, "message":f"Coordenadas atuais do recurso estão fora do intervalo válido - {client_resource_id}, Latitude:{geocode_lat_actual}, Longitude {geocode_long_actual}"})
+                duck.execute("UPDATE RESOURCES_TEMP set geocode_lat_actual = NULL, geocode_long_actual = NULL WHERE client_resource_id = ?",[client_resource_id])
+            
+            try:
+                if geocode_lat_start and geocode_long_start:
+                    lat = float(geocode_lat_start)
+                    long = float(geocode_long_start)
+                    if not (-40 <= lat <= 10 and -80 <= long <= -30):
+                        raise ValueError
+            except ValueError:
+                inconsistencies.append({"type":"WARNING", "id":client_resource_id, "message":f"Coordenadas de partida do recurso estão fora do intervalo válido - {client_resource_id}, Latitude:{geocode_lat_start}, Longitude {geocode_long_start}"})
+                duck.execute("UPDATE RESOURCES_TEMP set geocode_lat_start = NULL, geocode_long_start = NULL WHERE client_resource_id = ?",[client_resource_id])
+            
+            try:
+                if geocode_lat_end and geocode_long_end:
+                    lat = float(geocode_lat_end)
+                    long = float(geocode_long_end)
+                    if not (-40 <= lat <= 10 and -80 <= long <= -30):
+                        raise ValueError
+            except ValueError:
+                inconsistencies.append({"type":"WARNING", "id":client_resource_id, "message":f"Coordenadas de chegada do recurso estão fora do intervalo válido - {client_resource_id}, Latitude:{geocode_lat_end}, Longitude {geocode_long_end}"})
+                duck.execute("UPDATE RESOURCES_TEMP set geocode_lat_end = NULL, geocode_long_end = NULL WHERE client_resource_id = ?",[client_resource_id])
+        
+        print('Total de inconsistencias ...',len(inconsistencies))
+
+        if len(inconsistencies) > 0:
+            result = duck.execute("""
+                SELECT 
+                    client_resource_id, 
+                    resource_name,
+                    client_status_id,
+                    desc_status,
+                    off_shift_flag,
+                    off_shift_start_time,
+                    off_shift_end_time,
+                    geocode_lat_actual, 
+                    geocode_long_actual,
+                    geocode_lat_start,
+                    geocode_long_start,
+                    geocode_lat_end,
+                    geocode_long_end,
+                    modified_date,
+                    max(modified_date)  OVER (PARTITION BY 1)  last_snap  
+                FROM RESOURCES_TEMP
+                ORDER BY modified_date
+            """).pl().to_dicts()
+            
+        if result:
+            last_snap = result[0]['last_snap'].strftime('%Y-%m-%d %H:%M:%S')
+            dados_json = json.dumps(result, default=serializador_customizado)
+            
+            stmt = text(f"""
+                MERGE INTO resources AS u
+                    USING (SELECT x.*, rs.resource_status_id
+                            FROM jsonb_to_recordset(:dados_json)
+                            AS x(   client_resource_id text,
+                                    resource_name text,
+                                    client_status_id text,
+                                    off_shift_flag INTEGER,
+                                    off_shift_start_time TIME,
+                                    off_shift_end_time TIME,
+                                    geocode_lat_actual text, 
+                                    geocode_long_actual text,
+                                    geocode_lat_start text,
+                                    geocode_long_start text,
+                                    geocode_lat_end text,
+                                    geocode_long_end text,
+                                    modified_date TIMESTAMP
+                                )
+                            JOIN resource_status rs on rs.client_id = :client_id and rs.client_resource_status_id = x.client_status_id
+                            ) AS t
+                    ON u.client_id = :client_id AND u.client_resource_id = t.client_resource_id
+                    WHEN MATCHED AND (u.description IS DISTINCT FROM t.resource_name
+                                OR u.resource_status_id IS DISTINCT FROM t.resource_status_id
+                                OR u.off_shift_flag IS DISTINCT FROM t.off_shift_flag
+                                OR u.off_shift_start_time IS DISTINCT FROM t.off_shift_start_time
+                                OR u.off_shift_end_time IS DISTINCT FROM t.off_shift_end_time
+                                OR u.geocode_lat_actual IS DISTINCT FROM COALESCE(t.geocode_lat_actual, u.geocode_lat_actual)
+                                OR u.geocode_long_actual IS DISTINCT FROM COALESCE(t.geocode_long_actual, u.geocode_long_actual)
+                                OR u.geocode_lat_start IS DISTINCT FROM COALESCE(t.geocode_lat_start, u.geocode_lat_start)
+                                OR u.geocode_long_start IS DISTINCT FROM COALESCE(t.geocode_long_start, u.geocode_long_start)
+                                OR u.geocode_lat_end IS DISTINCT FROM COALESCE(t.geocode_lat_end, u.geocode_lat_end)
+                                OR u.geocode_long_end IS DISTINCT FROM COALESCE(t.geocode_long_end, u.geocode_long_end)
+                                ) and u.modified_date <= t.modified_date THEN
+                        UPDATE SET 
+                            description = t.resource_name,
+                            resource_status_id = t.resource_status_id,
+                            off_shift_flag = t.off_shift_flag,
+                            off_shift_start_time = t.off_shift_start_time,
+                            off_shift_end_time = t.off_shift_end_time,
+                            geocode_lat_actual = COALESCE(t.geocode_lat_actual, u.geocode_lat_actual), 
+                            geocode_long_actual = COALESCE(t.geocode_long_actual, u.geocode_long_actual),
+                            geocode_lat_start = COALESCE(t.geocode_lat_start, u.geocode_lat_start),
+                            geocode_long_start = COALESCE(t.geocode_long_start, u.geocode_long_start),
+                            geocode_lat_end = COALESCE(t.geocode_lat_end, u.geocode_lat_end),
+                            geocode_long_end = COALESCE(t.geocode_long_end, u.geocode_long_end),
+                            modified_date = t.modified_date
+
+                    WHEN NOT MATCHED THEN
+                        INSERT (client_id, client_resource_id, description, resource_status_id, geocode_lat_actual, geocode_long_actual, geocode_lat_start, geocode_long_start, geocode_lat_end, geocode_long_end, off_shift_flag, off_shift_start_time, off_shift_end_time, created_by, created_date, modified_by, modified_date, modified_date_geo, modified_date_login)
+                        VALUES (:client_id, t.client_resource_id, t.resource_name, t.resource_status_id, t.geocode_lat_actual, t.geocode_long_actual, t.geocode_lat_start, t.geocode_long_start, t.geocode_lat_end, t.geocode_long_end, t.off_shift_flag, t.off_shift_start_time, t.off_shift_end_time,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date, t.modified_date, t.modified_date)
+                    RETURNING
+                        u.resource_id, merge_action(), to_jsonb(u) AS registro_json
+                """)
+            result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+            await db.commit()
+            for row in result:
+                if row.merge_action == 'INSERT':
+                    contador_insert += 1
+                else:
+                    contador_update += 1
+
+            await setSnapTime(r,client_id, 'resources', last_snap)
+
+    return schemas.BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)
+
+
+@app.post("/resource_windows", response_model=schemas.BatchResponse, status_code=200)
+async def upsert_resource_windows(
+    body: list[schemas.ResourceWindowsUpsertRequest],
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(redis_client.get_redis),
+    duck: duckdb.DuckDBPyConnection = Depends(get_duckdb),
+    current: dict = Depends(get_integration_client),
+):
+    if not body:
+        return schemas.BatchResponse(processed=0, inserted=0, updated=0, results=[], errors=[])
+
+    client_id = current["clientId"]
+
+    inconsistencies = []
+    df_dados = pl.DataFrame(
+        body, 
+        infer_schema_length=None
+    )
+
+    contador = 0
+    contador_insert = 0
+    contador_update = 0
+
+    duck.execute("CREATE TEMP TABLE RESOURCE_WINDOWS_TEMP AS SELECT * FROM df_dados")
+    
+    result = duck.execute("""
+        SELECT 
+            client_resource_id, 
+            client_resource_window_id,
+            week_day,
+            description,
+            start_time,
+            end_time,
+            modified_date,
+            max(modified_date)  OVER (PARTITION BY 1)  last_snap  
+         FROM RESOURCE_WINDOWS_TEMP
+        ORDER BY modified_date
+    """).pl().to_dicts()
+    
+    if result:
+        last_snap = result[0]['last_snap'].strftime('%Y-%m-%d %H:%M:%S')
+
+        dados_json = json.dumps(result, default=serializador_customizado)
+        
+        stmt = text(f"""
+            MERGE INTO resource_windows AS u
+                USING (SELECT
+                        x.client_resource_id,
+                        x.client_resource_window_id,
+                        r.resource_id,
+                        week_day::INTEGER as week_day,
+                        x.description,
+                        x.start_time::TIME as start_time,
+                        x.end_time::TIME as end_time,
+                        x.modified_date
+                        FROM jsonb_to_recordset(:dados_json)
+                        AS x(
+                            client_resource_id text,
+                            client_resource_window_id text,
+                            week_day text,
+                            description text,
+                            start_time text,
+                            end_time text,
+                            modified_date TIMESTAMP)
+                        JOIN resources r ON r.client_resource_id = x.client_resource_id AND r.client_id = :client_id
+                        ) AS t
+                ON u.client_id = :client_id
+                        AND u.resource_id = t.resource_id
+                        AND u.client_rw_id = t.client_resource_window_id
+                WHEN MATCHED AND (
+                            u.description IS DISTINCT FROM t.description
+                            OR u.start_time IS DISTINCT FROM t.start_time
+                            OR u.end_time IS DISTINCT FROM t.end_time
+                            OR u.week_day IS DISTINCT FROM t.week_day
+                            )  and u.modified_date <= t.modified_date THEN 
+                    UPDATE SET description = t.description
+                        ,start_time = t.start_time
+                        ,end_time = t.end_time
+                        ,week_day = t.week_day
+                        ,modified_date = t.modified_date
+                        ,modified_by = 'INTEGRATION'
+                WHEN NOT MATCHED THEN
+                    INSERT (client_id, resource_id, client_rw_id, description, start_time, end_time, week_day, created_by, created_date, modified_by, modified_date)
+                    VALUES (:client_id, t.resource_id, t.client_resource_window_id, t.description, t.start_time, t.end_time, t.week_day,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_date)
+                RETURNING
+                    u.rw_id, merge_action(), to_jsonb(u) AS registro_json
+            """)
+        result = await db.execute(stmt, {"dados_json": dados_json, "client_id": client_id})
+        await db.commit()
+        for row in result:
+            if row.merge_action == 'INSERT':
+                contador_insert += 1
+            else:
+                contador_update += 1
+
+        await setSnapTime(r,client_id, 'resource_windows', last_snap)
+
+    return schemas.BatchResponse(processed=contador, inserted=contador_insert, updated=contador_update, results=[], errors=inconsistencies)

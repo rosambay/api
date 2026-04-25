@@ -1,4 +1,6 @@
 import asyncio
+import traceback
+import sys
 from loguru import logger
 from datetime import datetime, timedelta
 from sqlalchemy import text
@@ -13,7 +15,6 @@ CLIENT_ID     = "e226eb56-da6a-4f16-af12-cf02c8ad7fa2"
 CLIENT_SECRET = "da57626b-15fa-445a-9528-d3a698579b16"
 BASE_URL = "http://localhost:8000"
 
-snaps = None
 def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -32,9 +33,10 @@ async def get_token(client_id: str = CLIENT_ID, client_secret: str = CLIENT_SECR
 
 async def getSnaps(token: str):
     resp = httpx.get(f"{BASE_URL}/snaps", headers=auth_headers(token))
-    return json.loads(resp.json())
+    print(type(resp.json()))
+    return resp.json()
 
-async def getStyle(token: str, snaps: str):
+async def getStyle(token: str, snaps: dict):
 
     logger.warning("[getStyle] Entrou atualização de estilos...")
 
@@ -53,7 +55,7 @@ async def getStyle(token: str, snaps: str):
             logger.error(f"[getStyle] Erro ao processar : {e}")
     return
 
-async def getJobs(token: str, snaps: str):
+async def getJobs(token: str, snaps: dict):
 
     logger.warning("[getJobs] Entrou atualização das Tarefas ...")
 
@@ -74,6 +76,46 @@ async def getJobs(token: str, snaps: str):
                 logger.error(f"[getJobs] Erro ao processar : {e}")
     return
 
+async def getResources(token: str, snaps: dict):
+
+    logger.warning("[getResources] Entrou atualização dos Recursos ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['resources']
+    result_rows = await getResourcesMatrix(dateTime)
+
+    if result_rows:
+      try:
+          print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/resources", json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getResources] Erro ao processar : {e}")
+    return
+
+async def getResourceWindows(token: str, snaps: dict):
+
+    logger.warning("[getResourceWindows] Entrou atualização das janelas dos Recursos ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['resource_windows']
+    result_rows = await getResourceWindowMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/resource_windows", json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getResourceWindows] Erro ao processar : {e}")
+    return
+
 async def background_process():
     SLEEP_NORMAL = 10
     SLEEP_MAX = 300
@@ -84,35 +126,15 @@ async def background_process():
             try:
                 token = await get_token()
                 snaps = await getSnaps(token)
-                print(snaps)
-                await getStyle(token, snaps)
-                await asyncio.sleep(0.5)
+                print(snaps, type(snaps))
+                # await getStyle(token, snaps)
+                # await asyncio.sleep(0.5)
+                # await getResources(token, snaps)
+                # await asyncio.sleep(0.5)
+                await getResourceWindows(token,snaps)
 
-                # await getResources(r)
-                # await asyncio.sleep(0.2)
-                # await getResourceWindow(r)
-                # await asyncio.sleep(0.2)
-                # await getGeoPos(r)
-                # await asyncio.sleep(0.2)
-                # await getLogInOut(r)
-                # await asyncio.sleep(0.2)
-                await getJobs(token, snaps)
-                await asyncio.sleep(0.2)
-                # await getTeam(r)
-                # await asyncio.sleep(0.2)
-                # await getTeamMember(r)
-                # await asyncio.sleep(0.2)
-                # await getAddress(r)
-                # await asyncio.sleep(0.2)
-                # await getPlaces(r)
-                # await asyncio.sleep(0.2)
-                # await getJobType(r)
-                # await asyncio.sleep(0.2)
-                # await getJobStatus(r)
-                # await asyncio.sleep(0.2)
-                # await calcDistance(r)
-                # await asyncio.sleep(0.2)
-                # await checkPendencias(r)
+                # await getJobs(token, snaps)
+
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
                 consecutive_failures = 0
@@ -121,6 +143,17 @@ async def background_process():
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+        
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+            
+                # Extrai a última linha da pilha (onde o erro ocorreu)
+                detalhes = traceback.extract_tb(exc_traceback)[0]
+                
+                arquivo = detalhes.filename
+                linha = detalhes.lineno
+                funcao = detalhes.name
+                logger.error(f"Erro {e}")        
+                logger.error(f"Detalhes: {arquivo}, {linha} , {funcao}")      
                 consecutive_failures += 1
                 sleep_time = min(SLEEP_NORMAL * (2 ** consecutive_failures), SLEEP_MAX)
                 logger.error(f"Erro na iteração do background job (falha #{consecutive_failures}): {e}. Próxima tentativa em {sleep_time}s.")

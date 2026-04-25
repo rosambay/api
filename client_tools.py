@@ -737,6 +737,8 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                     CONVERT(VARCHAR(19), CAST(t.team_modified_dttm AS DATETIME2), 120) team_modified_date,
                     t.person_id AS client_resource_id,
                     concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
+                    p.status client_resource_status_id,
+                    p.desc_status resource_desc_status,  
                     CONVERT(VARCHAR(19), CAST(p.modified_dttm AS DATETIME2), 120) AS resource_modified_date,                                         
                     t.task_status AS client_status_id, 
                     case when mmd.message_text is null then t.desc_task_status else mmd.message_text end desc_status,
@@ -805,7 +807,6 @@ async def getStyleMetrix(dateTime: str = None, client_uid: str = None):
                     CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) AS modified_date
               from METRIX_ITEM_STYLE_VIEW
             where (modified_dttm >= CAST('{dateTime}' AS datetime))
-            order by modified_dttm ASC
             """)
         await client.close()
 
@@ -832,22 +833,22 @@ async def getResourcesMatrix(dateTime: str = None, client_uid: str = None):
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
             select 
-                p.person_id, 
-                concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS name,
-                p.geocode_lat, 
-                p.geocode_long, 
-                pg.geocode_lat_from,
-                pg.geocode_long_from, 
-                pg.geocode_lat_at, 
-                pg.geocode_long_at,
-                CASE WHEN p.work_status = 'OFF SHIFT' THEN 1 ELSE 0 END as work_status,
-                p.modified_dttm, 
-                max(p.modified_dttm)  OVER (PARTITION BY 1)  last_snap
+                p.person_id client_resource_id, 
+                concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
+                p.status client_status_id,
+                p.desc_status,  
+                CASE WHEN p.work_status = 'OFF SHIFT' THEN 1 ELSE 0 END as off_shift_flag,                                        
+                p.geocode_lat geocode_lat_actual, 
+                p.geocode_long geocode_long_actual, 
+                pg.geocode_lat_from geocode_lat_start,
+                pg.geocode_long_from geocode_long_start, 
+                pg.geocode_lat_at geocode_lat_end, 
+                pg.geocode_long_at geocode_long_end,
+                CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
               from C_PERSON_VW p WITH (NOEXPAND)
               LEFT JOIN c_person_geocode_vw pg ON p.person_id = pg.person_id
             where p.modified_dttm >= CAST('{dateTime}' AS datetime)
               and p.person_type = 'TECNICO'
-            order by p.modified_dttm desc
             """)
         await client.close()
 
@@ -1164,11 +1165,15 @@ async def getResourceWindowMatrix(dateTime: str = None, client_uid: str = None):
 # Recuperando o valor
 
         app_params_response = await client.execute_query(f"""
-            SELECT a.*, 
-                  MAX(a.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
+            SELECT  person_id client_resource_id, 
+                    work_cal_time_id client_resource_window_id,
+                    day_code week_day,
+                    description,
+                    CONVERT(VARCHAR(8), start_tm, 108) start_time,
+                    CONVERT(VARCHAR(8), stop_tm, 108) end_time,
+                    CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) modified_date
              FROM dbo.C_WORK_TIME_VW a WITH (NOEXPAND)
             WHERE a.modified_dttm >=  CAST('{dateTime}' AS datetime)
-            ORDER BY a.modified_dttm DESC
             """)
         await client.close()
 

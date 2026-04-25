@@ -417,13 +417,13 @@ async def getResourcesTree(
             uid as resource_uid,
             client_resource_id,
             description,
-            actual_geocode_lat,
-            actual_geocode_long,
-            geocode_lat_from,
-            geocode_long_from,
-            geocode_lat_at,
-            geocode_long_at,
-            fl_off_shift,
+            geocode_lat_actual,
+            geocode_long_actual,
+            geocode_lat_start,
+            geocode_long_start,
+            geocode_lat_end,
+            geocode_long_end,
+            off_shift_flag,
             time_setup,
             time_service,
             time_overlap,
@@ -580,10 +580,10 @@ async def getOpenJobs(
               j.resource_id,
               r.client_resource_id,
               r.description AS resource_name,
-              r.geocode_lat_from,
-              r.geocode_long_from,
-              r.geocode_lat_at,
-              r.geocode_long_at,
+              r.geocode_lat_start,
+              r.geocode_long_start,
+              r.geocode_lat_end,
+              r.geocode_long_end,
               j.job_status_id,
               js.description,
               j.job_type_id,
@@ -923,10 +923,10 @@ async def getSimulationJobs(
               j.address_id,
               a.geocode_lat,
               a.geocode_long,
-              r.geocode_lat_from,
-              r.geocode_long_from,
-              r.geocode_lat_at,
-              r.geocode_long_at,
+              r.geocode_lat_start,
+              r.geocode_long_start,
+              r.geocode_lat_end,
+              r.geocode_long_end,
               j.place_id,
               j.time_setup,
               j.time_service,
@@ -955,18 +955,18 @@ async def getSimulationJobs(
         if not rows:
           raise HTTPException(status_code=400, detail="Não há trabalho com status de concluido neste dia.")  
         rId = None
-        geocode_long_at = None
-        geocode_lat_at = None
+        geocode_long_end = None
+        geocode_lat_end = None
         geo = []
         for row in rows:
           if rId is None:
-            geo.append([row.geocode_long_from,row.geocode_lat_from])
-            geocode_long_at = row.geocode_long_at
-            geocode_lat_at = row.geocode_lat_at
+            geo.append([row.geocode_long_start,row.geocode_lat_start])
+            geocode_long_end = row.geocode_long_end
+            geocode_lat_end = row.geocode_lat_end
             rId = 1
           geo.append([row.geocode_long,row.geocode_lat])
 
-        geo.append([geocode_long_at,geocode_lat_at])
+        geo.append([geocode_long_end,geocode_lat_end])
         logger.info('Pegou rotas...')
         geoResult = await get_route_distance_block(geo)
         logger.info('Finalizou rotas...')
@@ -1080,12 +1080,12 @@ async def getSimulationJobs(
                 select 
                   r.resource_id,
                   r.description,
-                  r.geocode_lat_from::NUMERIC,
-                  r.geocode_long_from::NUMERIC,
-                  r.geocode_lat_at::NUMERIC,
-                  r.geocode_long_at::NUMERIC, 
-                  EXTRACT(EPOCH FROM rw.start_time) ::INTEGER AS start_time,
-                  EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end ) ::INTEGER AS end_time
+                  r.geocode_lat_start::NUMERIC,
+                  r.geocode_long_start::NUMERIC,
+                  r.geocode_lat_end::NUMERIC,
+                  r.geocode_long_end::NUMERIC, 
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.start_time else off_shift_start_time end ) ::INTEGER AS start_time
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.end_time else r.off_shift_end_time end ) ::INTEGER AS end_time
                 from resources r
                   join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM CAST(:p_date AS DATE)) + 1
                   where exists (select 1 from jobs_data j
@@ -1098,8 +1098,8 @@ async def getSimulationJobs(
                       json_build_object(
                           'id', resource_id,
                           'description', description,
-                          'start', json_build_array(geocode_long_from, geocode_lat_from),
-                          'end', json_build_array(geocode_long_at, geocode_lat_at),
+                          'start', json_build_array(geocode_long_start, geocode_lat_start),
+                          'end', json_build_array(geocode_long_end, geocode_lat_end),
                           'time_window', json_build_array(start_time, end_time)
                       ))
                   ) AS array_vehicles
@@ -1277,12 +1277,12 @@ async def getSimulationJobs(
                 select 
                   r.resource_id,
                   r.description,
-                  r.geocode_lat_from::NUMERIC,
-                  r.geocode_long_from::NUMERIC,
-                  r.geocode_lat_at::NUMERIC,
-                  r.geocode_long_at::NUMERIC, 
-                  EXTRACT(EPOCH FROM rw.start_time) ::INTEGER AS start_time,
-                  EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end) ::INTEGER AS end_time
+                  r.geocode_lat_start::NUMERIC,
+                  r.geocode_long_start::NUMERIC,
+                  r.geocode_lat_end::NUMERIC,
+                  r.geocode_long_end::NUMERIC, 
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.start_time else off_shift_start_time end ) ::INTEGER AS start_time
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.end_time else r.off_shift_end_time end ) ::INTEGER AS end_time
                 from resources r
                   join resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM CAST(:p_date AS DATE)) + 1
                   where exists (select 1 from jobs_data j
@@ -1295,8 +1295,8 @@ async def getSimulationJobs(
                       json_build_object(
                           'id', resource_id,
                           'description', description,
-                          'start', json_build_array(geocode_long_from, geocode_lat_from),
-                          'end', json_build_array(geocode_long_at, geocode_lat_at),
+                          'start', json_build_array(geocode_long_start, geocode_lat_start),
+                          'end', json_build_array(geocode_long_end, geocode_lat_end),
                           'time_window', json_build_array(start_time, end_time)
                       ))
                   ) AS array_vehicles
@@ -1361,10 +1361,10 @@ async def getSimulationJobs(
                   r.time_overlap,
                   a.geocode_lat::NUMERIC AS geocode_lat,
                   a.geocode_long::NUMERIC AS geocode_long,
-                  r.geocode_lat_from,
-                  r.geocode_long_from,
-                  r.geocode_lat_at,
-                  r.geocode_long_at,
+                  r.geocode_lat_start,
+                  r.geocode_long_start,
+                  r.geocode_lat_end,
+                  r.geocode_long_end,
                   COALESCE(j.time_service,jt.time_service,t.time_service) AS time_service,
                   q1.arrival,
                   q1.duration,
@@ -1389,17 +1389,17 @@ async def getSimulationJobs(
         result = await db.execute(smtp)
         rows = result.mappings().all()
         rId = None
-        geocode_long_at = None
-        geocode_lat_at = None
+        geocode_long_end = None
+        geocode_lat_end = None
         geo = []
         for row in rows:
           if rId is None:
-            geo.append([row.geocode_long_from,row.geocode_lat_from])
-            geocode_long_at = row.geocode_long_at
-            geocode_lat_at = row.geocode_lat_at
+            geo.append([row.geocode_long_start,row.geocode_lat_start])
+            geocode_long_end = row.geocode_long_end
+            geocode_lat_end = row.geocode_lat_end
             rId = 1
           geo.append([row.geocode_long,row.geocode_lat])
-        geo.append([geocode_long_at,geocode_lat_at])
+        geo.append([geocode_long_end,geocode_lat_end])
         geoResult = await get_route_distance_block(geo)
         simulatedWindowEndDate = None
         simulatedWindowDistanceEnd = 0
@@ -1853,12 +1853,12 @@ async def getSimulationBestRouteJobs(
                 select
                   r.resource_id,
                   r.description,
-                  r.geocode_lat_from::NUMERIC,
-                  r.geocode_long_from::NUMERIC,
-                  r.geocode_lat_at::NUMERIC,
-                  r.geocode_long_at::NUMERIC,
-                  EXTRACT(EPOCH FROM rw.start_time) ::INTEGER AS start_time,
-                  EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then rw.end_time else cast('23:59:59.9999' as time) end ) ::INTEGER AS end_time
+                  r.geocode_lat_start::NUMERIC,
+                  r.geocode_long_start::NUMERIC,
+                  r.geocode_lat_end::NUMERIC,
+                  r.geocode_long_end::NUMERIC,
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.start_time else off_shift_start_time end ) ::INTEGER AS start_time
+                  EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then rw.end_time else r.off_shift_end_time end ) ::INTEGER AS end_time
                 from resources r
                   join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
                   join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
@@ -1873,8 +1873,8 @@ async def getSimulationBestRouteJobs(
                       json_build_object(
                           'id', resource_id,
                           'description', description,
-                          'start', json_build_array(geocode_long_from, geocode_lat_from),
-                          'end', json_build_array(geocode_long_at, geocode_lat_at),
+                          'start', json_build_array(geocode_long_start, geocode_lat_start),
+                          'end', json_build_array(geocode_long_end, geocode_lat_end),
                           'time_window', json_build_array(start_time, end_time)
                       ))
                   ) AS array_vehicles
@@ -2002,10 +2002,10 @@ async def getSimulationBestRouteJobs(
                       r.time_overlap,
                       a.geocode_lat,
                       a.geocode_long,
-                      r.geocode_lat_from,
-                      r.geocode_long_from,
-                      r.geocode_lat_at,
-                      r.geocode_long_at,
+                      r.geocode_lat_start,
+                      r.geocode_long_start,
+                      r.geocode_lat_end,
+                      r.geocode_long_end,
                       COALESCE(j.time_service,jt.time_service,t.time_service) AS time_service,
                       q1.arrival,
                       q2.arrival AS arrival_start,
@@ -2033,21 +2033,21 @@ async def getSimulationBestRouteJobs(
         result = await db.execute(smtp)
         rows = result.mappings().all()
         rId = None
-        geocode_long_at = None
-        geocode_lat_at = None
+        geocode_long_end = None
+        geocode_lat_end = None
         geo = []
         arrivalStart = None
         arrivalEnd = None
         for row in rows:
           if rId is None:
-            geo.append([float(row.geocode_long_from),float(row.geocode_lat_from)])
-            geocode_long_at = row.geocode_long_at
-            geocode_lat_at = row.geocode_lat_at
+            geo.append([float(row.geocode_long_start),float(row.geocode_lat_start)])
+            geocode_long_end = row.geocode_long_end
+            geocode_lat_end = row.geocode_lat_end
             arrivalStart = row.arrival_start
             arrivalEnd = row.arrival_end
             rId = 1
           geo.append([float(row.geocode_long),float(row.geocode_lat)])
-        geo.append([float(geocode_long_at),float(geocode_lat_at)])
+        geo.append([float(geocode_long_end),float(geocode_lat_end)])
         
         geoResult = await get_route_distance_block(geo)
         print(json.dumps(geoResult))
@@ -2458,10 +2458,10 @@ async def scheduleJobs(
                 select
                 r.resource_id,
                 r.description,
-                COALESCE(r.geocode_lat_from,t.geocode_lat)::NUMERIC AS geocode_lat_from,
-                COALESCE(r.geocode_long_from,t.geocode_long)::NUMERIC AS geocode_long_from,
-                COALESCE(r.geocode_lat_at,t.geocode_lat)::NUMERIC AS geocode_lat_at,
-                COALESCE(r.geocode_long_at,t.geocode_long)::NUMERIC AS geocode_long_at,
+                COALESCE(r.geocode_lat_start,t.geocode_lat)::NUMERIC AS geocode_lat_start,
+                COALESCE(r.geocode_long_start,t.geocode_long)::NUMERIC AS geocode_long_start,
+                COALESCE(r.geocode_lat_end,t.geocode_lat)::NUMERIC AS geocode_lat_end,
+                COALESCE(r.geocode_long_end,t.geocode_long)::NUMERIC AS geocode_long_end,
                 CASE 
                     WHEN DATE_TRUNC('day',now()) < s.simulation_date
                         THEN 
@@ -2475,7 +2475,7 @@ async def scheduleJobs(
                               EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time))
                         END
                 END AS start_time,
-                EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
+                EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
                 from resources r
                 join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
                 join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
@@ -2483,10 +2483,10 @@ async def scheduleJobs(
                 LEFT JOIN resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM s.simulation_date) + 1
                 where r.client_id = :client_id
                 and s.simulation_id = :simulation_id
-                AND COALESCE(r.geocode_lat_from, t.geocode_lat) IS NOT NULL
-                AND COALESCE(r.geocode_long_from, t.geocode_long) IS NOT NULL
-                AND COALESCE(r.geocode_lat_at, t.geocode_lat) IS NOT NULL
-                AND COALESCE(r.geocode_long_at, t.geocode_long) IS NOT NULL
+                AND COALESCE(r.geocode_lat_start, t.geocode_lat) IS NOT NULL
+                AND COALESCE(r.geocode_long_start, t.geocode_long) IS NOT NULL
+                AND COALESCE(r.geocode_lat_end, t.geocode_lat) IS NOT NULL
+                AND COALESCE(r.geocode_long_end, t.geocode_long) IS NOT NULL
                 and r.resource_id IN ({','.join(str(j) for j in resources)})
             ),
             vehicles_json AS (
@@ -2495,8 +2495,8 @@ async def scheduleJobs(
                 json_build_object(
                     'id', resource_id,
                     'description', description,
-                    'start', json_build_array(geocode_long_from, geocode_lat_from),
-                    'end', json_build_array(geocode_long_at, geocode_lat_at),
+                    'start', json_build_array(geocode_long_start, geocode_lat_start),
+                    'end', json_build_array(geocode_long_end, geocode_lat_end),
                     'time_window', json_build_array(start_time, end_time)
                 ))
             ) AS array_vehicles
@@ -2670,14 +2670,14 @@ async def scheduleJobs(
                     j.trade_name, 
                     j.cnpj,
                     j.job_day,
-                    q_1.geocode_long AS geocode_long_from,
-                    q_1.geocode_lat AS  geocode_lat_from,
+                    q_1.geocode_long AS geocode_long_start,
+                    q_1.geocode_lat AS  geocode_lat_start,
                     q_1.arrival AS arrival_from,
                     q_3.distance AS distance_from,
                     q_3.time_distance as time_distance_from,
                     
-                    q_2.geocode_long AS geocode_long_at,
-                    q_2.geocode_lat AS  geocode_lat_at,
+                    q_2.geocode_long AS geocode_long_end,
+                    q_2.geocode_lat AS  geocode_lat_end,
                     q_2.arrival AS arrival_at,
                     q_2.distance AS distance_at,
                     q_2.time_distance as time_distance_at,
@@ -2737,14 +2737,14 @@ async def scheduleJobs(
                     q.client_resource_id,
                     q.resource_name,
                     q.job_day,
-                    q.geocode_long_from,
-                    q.geocode_lat_from,
+                    q.geocode_long_start,
+                    q.geocode_lat_start,
                     q.distance_from,
                     q.time_distance_from,
                     q.arrival_from,
                     q.date_from,
-                    q.geocode_long_at,
-                    q.geocode_lat_at,
+                    q.geocode_long_end,
+                    q.geocode_lat_end,
                     q.distance_at,
                     q.time_distance_at,
                     q.arrival_at,
@@ -2789,14 +2789,14 @@ async def scheduleJobs(
                         'client_resource_id', client_resource_id,
                         'resource_name', resource_name,
                         'job_day', job_day,
-                        'geocode_long_from', geocode_long_from,
-                        'geocode_lat_from', geocode_lat_from,
+                        'geocode_long_start', geocode_long_start,
+                        'geocode_lat_start', geocode_lat_start,
                         'distance_from', distance_from,
                         'time_distance_from', time_distance_from,
                         'arrival_from', arrival_from,
                         'date_from', date_from,
-                        'geocode_long_at', geocode_long_at,
-                        'geocode_lat_at', geocode_lat_at,
+                        'geocode_long_end', geocode_long_end,
+                        'geocode_lat_end', geocode_lat_end,
                         'distance_at', distance_at,
                         'time_distance_at', time_distance_at,
                         'arrival_at', arrival_at,
