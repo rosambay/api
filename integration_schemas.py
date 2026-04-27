@@ -47,7 +47,7 @@ class JobUpsertRequest(BaseModel):
     plan_time_service: Optional[int] = Field(None, description="Tempo de serviço planejado em segundos da tarefa, se houver, no sistema do cliente")    
     limit_start_date: Optional[datetime] = Field(None, description="Data/hora limite de início da tarefa, se houver, no sistema do cliente")
     limit_end_date: Optional[datetime] = Field(None, description="Data/hora limite de término da tarefa, se houver, no sistema do cliente")
-    priority: Optional[str] = Field(None, description="Prioridade da tarefa, se houver, no sistema do cliente")
+    priority: int = Field(default=0, description="Prioridade da tarefa, se houver, no sistema do cliente")
     time_setup: Optional[int] = Field(None, description="Tempo de configuração em segundos da tarefa, se houver, no sistema do cliente")
     time_overlap: Optional[int] = Field(None, description="Tempo de sobreposição em segundos da tarefa, se houver, no sistema do cliente")
     distance: Optional[int] = Field(None, description="Distância em metros da tarefa, se houver, no sistema do cliente")
@@ -81,6 +81,61 @@ class ResourceWindowsUpsertRequest(BaseModel):
     end_time: str = Field(..., pattern=r"^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$", description="Indica a hora final limite para atuar fora do turno.")
     modified_date: datetime = Field(..., description="Data/hora da ultima atualização da tarefa")
 
+class AddressRequest(BaseModel):
+    client_address_id: str = Field(..., description="ID endereço no sistema do cliente")
+    address: str = Field(..., description="Endereço completo no sistema do cliente")
+    city: str = Field(..., description="Cidade no sistema do cliente")
+    state: Optional[str] = Field(None, description="Estado no sistema do cliente")
+    zippost: Optional[str] = Field(None, description="CEP no sistema do cliente")
+    geocode_lat: Optional[str] = Field(None, description="Latitude do endereço no sistema do cliente")
+    geocode_long: Optional[str] = Field(None, description="Longitude do endereço no sistema do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do endereço")
+
+class PlacesRequest(BaseModel):
+    client_place_id: str = Field(..., description="ID do local no sistema do cliente")
+    trade_name: str = Field(..., description="Nome do local/estabelecimento no sistema do cliente")
+    cnpj: Optional[str] = Field(None, description="cnpj do local do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do local")
+
+class TeamsRequest(BaseModel):
+    client_team_id: str = Field(..., description="ID da equpe no sistema do cliente")
+    team_name: str = Field(..., description="Nome da equipe no sistema do cliente")
+    geocode_lat: Optional[str] = Field(None, description="Latitude do local da equipe, se houver, no sistema do cliente")
+    geocode_long: Optional[str] = Field(None, description="Longitude do local da equipe, se houver, no sistema do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do local")
+
+class TeamMembersRequest(BaseModel):
+    client_team_id: str = Field(..., description="ID da Equipe no sistema do cliente")
+    client_resource_id: str = Field(..., description="ID do recurso da equipe no sistema do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do membro da equipe")
+
+class JobTypesRequest(BaseModel):
+    client_job_type_id: str = Field(..., description="ID do tipo de trabalho/tarefa do cliente")
+    desc_job_type: str = Field(..., description="Descrição do tipo de trabalho/tarefa do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do tipo de trabalho/tarefa")
+
+class JobStatusRequest(BaseModel):
+    client_job_status_id: str = Field(..., description="ID da situação/status do trabalho/tarefa do cliente")
+    desc_job_status: str = Field(..., description="Descrição da situação/status do trabalho/tarefa do cliente")
+    client_style_id: Optional[str] = Field(None, description="ID do estilo (style) da tarefa no sistema do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do tipo de trabalho/tarefa")
+
+class ResourceLoggedInOutRequest(BaseModel):
+    client_resource_id: str = Field(..., description="ID do recurso do cliente")
+    logged_in: datetime = Field(..., description="Data/hora da ultima login efetuado pelo recurso")
+    logged_out: Optional[datetime] = Field(None, description="Data/hora do logoff efetuado pelo recurso")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização de login/logoff")
+
+class ResourceActualGeoPosRequest(BaseModel):
+    client_resource_id: str = Field(..., description="ID do recurso do cliente")
+    geocode_lat: str = Field(..., description="Latitude atual do recurso no sistema do cliente")
+    geocode_long: str = Field(..., description="Longitude atual do recurso no sistema do cliente")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do local")
+
+class PriorityRequest(BaseModel):
+    client_priority_id: str = Field(..., description="ID da prioridade do cliente")
+    priority: int = Field(..., description="Ranking da prioridade 0 a 100 por ordem de prioridade")
+    modified_date: datetime = Field(..., description="Data/hora da ultima atualização do local")
 class UpsertResponse(BaseModel):
     id: int
     client_id: str

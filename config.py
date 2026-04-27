@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     passwd: str
     client_uid: int
     mapbox_key: str
+    database_url: str
     vroom_url: str = "https://routes.imagineit.com.br/routing"
     osrm_url: str = "https://routes.imagineit.com.br/routes"
     mapbox_url: str = "https://api.mapbox.com/geocoding/v5/mapbox.places"

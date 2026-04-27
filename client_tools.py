@@ -7,15 +7,6 @@ from loguru import logger
 from fsm_client import FSMClient, FSMConnectionConfig, FSMTarget
 from config import settings
 
-_SESSION_RE = re.compile(r'^[A-Za-z0-9_\-]{1,128}$')
-_TOKEN_RE   = re.compile(r'^[A-Za-z0-9_\-\.]{1,256}$')
-
-def _validate_session(value: str, label: str = "session") -> str:
-    """Valida session_id/token contra um padrão seguro e retorna o valor."""
-    if not value or not _SESSION_RE.match(value):
-        raise ValueError(f"Valor inválido para '{label}': contém caracteres não permitidos.")
-    return value
-
 def _validate_datetime(value: str, label: str = "dateTime") -> str:
     """Valida e re-formata um datetime ISO para evitar injeção SQL."""
     try:
@@ -68,7 +59,6 @@ def get_element_full_text(element) -> str:
         # Fallback: apenas texto
         return element.text or ""
 
-
 def get_tag_name(tag: str) -> str:
     """Remove namespace de uma tag XML e retorna apenas o nome."""
     if not tag:
@@ -76,7 +66,6 @@ def get_tag_name(tag: str) -> str:
     if '}' in tag:
         return tag.split('}', 1)[1]
     return tag
-
 
 def parse_xml_dataset(xml_response: str) -> tuple[List[str], List[Dict[str, Any]]]:
     """
@@ -442,277 +431,6 @@ def parse_xml_dataset(xml_response: str) -> tuple[List[str], List[Dict[str, Any]
         logger.error(f"[parse_xml_dataset] Traceback: {traceback.format_exc()}")
         return columns, rows
 
-
-def parse_hierarchy_response(xml_response: str) -> tuple[List[str], List[Dict[str, Any]]]:
-    """
-    Parse XML response de hierarchy_select.
-    
-    CRÍTICO: Preserva formatação XML original (indentação, espaços entre tags, etc.)
-    para campos XML aninhados como rule_note em process_rule_def.
-    """
-    columns = []
-    rows = []
-    
-    try:
-        xml_response = xml_response.strip()
-        if not xml_response:
-            return columns, rows
-        
-        # CRÍTICO: Para preservar formatação XML original, usar regex para extrair valores
-        # ao invés de ET.fromstring + child.text que pode perder formatação
-        # Extrair rows com regex (preserva formatação original)
-        # Suporta namespaces: <row> ou <ns:row>
-        row_pattern = r'<(?:\w+:)?row>(.*?)</(?:\w+:)?row>'
-        row_contents = re.findall(row_pattern, xml_response, re.DOTALL)
-        
-        for row_content in row_contents:
-            row = {}
-            # Extrair cada coluna usando parser que conta tags aninhadas
-            # CRÍTICO: Preserva formatação XML original (indentação, quebras de linha, etc.)
-            
-            def extract_tag_content(content: str, start_pos: int) -> tuple[str, int, str]:
-                """
-                Extrai conteúdo de uma tag XML, contando tags aninhadas.
-                Retorna: (tag_name, end_position, tag_value)
-                """
-                # Procurar tag de abertura
-                tag_start = content.find('<', start_pos)
-                if tag_start == -1:
-                    return None, len(content), None
-                
-                # Pular comentários XML
-                if content[tag_start:tag_start+4] == '<!--':
-                    comment_end = content.find('-->', tag_start + 4)
-                    if comment_end == -1:
-                        return None, len(content), None
-                    return extract_tag_content(content, comment_end + 3)
-                
-                # Encontrar fim da tag de abertura
-                tag_end = content.find('>', tag_start)
-                if tag_end == -1:
-                    return None, len(content), None
-                
-                tag_full = content[tag_start + 1:tag_end].strip()
-                
-                # Verificar se é tag auto-fechada
-                if tag_full.endswith('/'):
-                    tag_name = tag_full[:-1].split()[0]
-                    if ':' in tag_name:
-                        tag_name = tag_name.split(':', 1)[1]
-                    return get_tag_name(tag_name), tag_end + 1, ""
-                
-                # Extrair nome da tag
-                tag_parts = tag_full.split()
-                tag_name_raw = tag_parts[0]
-                if ':' in tag_name_raw:
-                    tag_name_raw = tag_name_raw.split(':', 1)[1]
-                tag_name = get_tag_name(tag_name_raw)
-                
-                # Buscar tag de fechamento, contando tags aninhadas
-                content_start = tag_end + 1
-                depth = 1
-                pos = content_start
-                
-                while depth > 0 and pos < len(content):
-                    next_tag = content.find('<', pos)
-                    if next_tag == -1:
-                        break
-                    
-                    # Pular comentários
-                    if content[next_tag:next_tag+4] == '<!--':
-                        comment_end = content.find('-->', next_tag + 4)
-                        if comment_end == -1:
-                            break
-                        pos = comment_end + 3
-                        continue
-                    
-                    tag_close = content.find('>', next_tag)
-                    if tag_close == -1:
-                        break
-                    
-                    tag_inner = content[next_tag + 1:tag_close].strip()
-                    
-                    # Pular tags auto-fechadas
-                    if tag_inner.endswith('/'):
-                        pos = tag_close + 1
-                        continue
-                    
-                    # Verificar se é abertura ou fechamento da mesma tag
-                    if tag_inner.startswith('/'):
-                        closing_name = tag_inner[1:].split()[0]
-                        if ':' in closing_name:
-                            closing_name = closing_name.split(':', 1)[1]
-                        if closing_name == tag_name:
-                            depth -= 1
-                            if depth == 0:
-                                # Encontrou fechamento correto
-                                value = content[content_start:next_tag]
-                                return tag_name, tag_close + 1, value
-                    else:
-                        opening_name = tag_inner.split()[0]
-                        if ':' in opening_name:
-                            opening_name = opening_name.split(':', 1)[1]
-                        if opening_name == tag_name:
-                            depth += 1
-                    
-                    pos = tag_close + 1
-                
-                # Não encontrou fechamento
-                return tag_name, tag_end + 1, None
-            
-            # Extrair todas as tags de primeiro nível
-            pos = 0
-            while pos < len(row_content):
-                tag_name, next_pos, value = extract_tag_content(row_content, pos)
-                if tag_name is None:
-                    break
-                if value is not None:
-                    row[tag_name] = value
-                    if tag_name not in columns:
-                        columns.append(tag_name)
-                    
-                    # DEBUG: Log para campos XML comuns que precisam preservar formatação
-                    xml_fields = ['rule_note', 'value', 'xml_message', 'validation_xml', 'alternate_xml', 'process_xml']
-                    if tag_name.lower() in xml_fields and value and value.strip().startswith('<'):
-                        logger.debug(f"=== DEBUG: Campo XML {tag_name} EXTRAÍDO PELO PARSER ===")
-                        logger.debug(f"Length: {len(value)}")
-                        logger.debug(f"Has newlines: {chr(10) in value}")
-                        logger.debug(f"Has tabs: {chr(9) in value}")
-                        logger.debug(f"Has 4-space indent: {'    ' in value}")
-                        logger.debug(f"Has 2-space indent: {'  ' in value}")
-                        logger.debug(f"First 300 chars: {repr(value[:300])}")
-                        logger.debug(f"=== FIM Campo XML {tag_name} EXTRAÍDO ===")
-                
-                pos = next_pos
-            
-            if row:
-                rows.append(row)
-        
-        # Se regex não encontrou resultados, usar fallback com ET.fromstring
-        if not rows:
-            root = ET.fromstring(xml_response)
-            
-            # Procura por row elements
-            for row_elem in root.findall(".//row"):
-                row = {}
-                for child in row_elem:
-                    tag = get_tag_name(child.tag)
-                    # CRÍTICO: Para campos XML, tentar preservar formatação original
-                    if len(child) == 0:
-                        # Sem filhos - usar text diretamente (preserva formatação)
-                        text = child.text or ""
-                    else:
-                        # Com filhos - usar get_element_full_text que tenta preservar formatação
-                        text = get_element_full_text(child)
-                    row[tag] = text
-                    if tag not in columns:
-                        columns.append(tag)
-                if row:
-                    rows.append(row)
-        
-        return columns, rows
-        
-    except ET.ParseError:
-        return columns, rows
-
-async def getUserSession(session):
-    try:
-            # Cria cliente FSM
-        config = FSMConnectionConfig(
-            host=settings.url_fsm,
-            username=settings.usuario,
-            password=settings.senha,
-            target=FSMTarget.WCF
-        )
-        
-        # config = FSMConnectionConfig(
-        #     host='https://MTLfsmTST.avcweb.com.br:443/FSMServerTST/',
-        #     username='hasaus',
-        #     password='mfrio123',
-        #     target=FSMTarget.WCF
-        # )
-        client = FSMClient(config)
-
-        safe_session = _validate_session(session)
-        app_params_response = await client.execute_query(f"""
-            SELECT session_id, user_id, token
-              FROM dbo.c_user_sessions_maps
-              WHERE session_id = '{safe_session}'
-            """)
-        await client.close()
-
-        if app_params_response.success:
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-       
-        return (result_rows)
-        
-    except Exception as e:
-        logger.error(f"Erro na conexão: {e}")    
-
-async def setUserSession(session,token):
-    try:
-            # Cria cliente FSM
-        config = FSMConnectionConfig(
-            host=settings.url_fsm,
-            username=settings.usuario,
-            password=settings.senha,
-            target=FSMTarget.WCF
-        )
-        
-        # config = FSMConnectionConfig(
-        #     host='https://MTLfsmTST.avcweb.com.br:443/FSMServerTST/',
-        #     username='hasaus',
-        #     password='mfrio123',
-        #     target=FSMTarget.WCF
-        # )
-        client = FSMClient(config)
-
-        safe_session = _validate_session(session)
-        safe_token = _validate_session(token, label="token")
-        app_params_response = await client.execute_edit(f"""
-            UPDATE dbo.c_user_sessions_maps
-               set token = '{safe_token}'
-              WHERE session_id = '{safe_session}'
-            """)
-        await client.close()
-        return
-        
-    except Exception as e:
-        logger.error(f"Erro na conexão: {e}")    
-
-async def dropUserSession(session):
-    try:
-            # Cria cliente FSM
-        config = FSMConnectionConfig(
-            host=settings.url_fsm,
-            username=settings.usuario,
-            password=settings.senha,
-            target=FSMTarget.WCF
-        )
-        
-        # config = FSMConnectionConfig(
-        #     host='https://MTLfsmTST.avcweb.com.br:443/FSMServerTST/',
-        #     username='hasaus',
-        #     password='mfrio123',
-        #     target=FSMTarget.WCF
-        # )
-        client = FSMClient(config)
-
-        safe_session = _validate_session(session)
-        app_params_response = await client.execute_edit(f"""
-            delete from dbo.c_user_sessions_maps
-              WHERE session_id = '{safe_session}'
-            """)
-        await client.close()
-
-        if app_params_response.success:
-                logger.info(f"[SQL Query Tool] Template exclusão executado com sucesso")
-            
-        return
-        
-    except Exception as e:
-        logger.error(f"Erro na conexão: {e}")    
-
 async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
     try:
         dateTime = _validate_datetime(dateTime)
@@ -774,6 +492,12 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
                 FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
                     LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
                     LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
+                    LEFT JOIN dbo.C_PRIORITY_VW cp ON t.person_id = p.person_id
+                                                         
+                SELECT 
+              contr_type, 
+              ranking 
+             FROM dbo.C_PRIORITY_VW
 			    WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
                  ORDER BY t.modified_dttm ASC 
             
@@ -872,14 +596,17 @@ async def getAdressMatrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-          SELECT a.*, 
-                  MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-            FROM (                                             
-                SELECT *
+            SELECT  address_id client_address_id,
+                    address,
+                    geocode_lat,
+                    geocode_long,
+                    city,
+                    state_prov state,
+                    zippost,
+                    CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
                 from C_ADDRESS_VW a WITH (NOEXPAND)
                 where a.modified_dttm >= CAST('{dateTime}' AS datetime)
-            ) AS a
-            order by a.modified_dttm desc                                                         
+               order by a.modified_dttm ASC
             """)
         await client.close()
 
@@ -903,14 +630,13 @@ async def getPlaceMatrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-          SELECT a.*, 
-                  MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-            FROM (                                             
-                SELECT *
-                from C_PLACE_VW a WITH (NOEXPAND)
-                where a.modified_dttm >= CAST('{dateTime}' AS datetime)
-            ) AS a
-            order by a.modified_dttm desc                                                         
+            SELECT  place_id client_place_id,
+                    trade_name,
+                    cnpj,
+                    CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
+            from C_PLACE_VW a WITH (NOEXPAND)
+            where a.modified_dttm >= CAST('{dateTime}' AS datetime)
+          order by a.modified_dttm ASC                                                     
             """)
         await client.close()
 
@@ -934,7 +660,11 @@ async def getLogInOutMatrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-            select a.*, max(modified_dttm)  OVER (PARTITION BY 1)  last_snap
+            select 
+                person_id client_resource_id, 
+                logged_in, 
+                logged_out, 
+                CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
               from (select person_id, logged_in, logged_out, modified_dttm,
                     ROW_NUMBER() OVER(
                         PARTITION BY person_id 
@@ -942,19 +672,24 @@ async def getLogInOutMatrix(dateTime: str = None, client_uid: str = None):
                     ) AS linha_num
                       from C_LOG_HISTORY_VW WITH (NOEXPAND)
                       where modified_dttm >= CAST('{dateTime}' AS datetime) ) as a
-            WHERE linha_num = 1
-              order by modified_dttm desc
+              WHERE linha_num = 1
             """)
         await client.close()
 
         if app_params_response.success:
-                logger.info(f"[getLogInOutMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        
-        return (result_rows)    
-        
+            logger.info(f"[getLogInOutMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getLogInOutMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getLogInOutMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getGeoPosMatrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -970,11 +705,10 @@ async def getGeoPosMatrix(dateTime: str = None, client_uid: str = None):
         app_params_response = await client.execute_query(f"""
                                                          
             SELECT 
-                modified_by, 
+                modified_by client_resource_id, 
                 geocode_lat, 
                 geocode_long, 
-                modified_dttm,
-                max(modified_dttm)  OVER (PARTITION BY 1)  last_snap
+                CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
             FROM (SELECT 
                     modified_by, 
                     geocode_lat, 
@@ -984,22 +718,27 @@ async def getGeoPosMatrix(dateTime: str = None, client_uid: str = None):
                         PARTITION BY modified_by 
                         ORDER BY modified_dttm DESC
                     ) AS linha_num
-                FROM geoposition
+                FROM dbo.geoposition
                 WHERE modified_dttm >=  CAST('{dateTime}' AS datetime)
                 ) as a
             WHERE linha_num = 1
-              order by modified_dttm desc
             """)
         await client.close()
 
         if app_params_response.success:
-                logger.info(f"[getGeoPosMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        
-        return (result_rows)
-        
+            logger.info(f"[getGeoPosMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getGeoPosMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getGeoPosMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getTeamMemberMatrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -1017,11 +756,14 @@ async def getTeamMemberMatrix(dateTime: str = None, client_uid: str = None):
 # Recuperando o valor
 
         app_params_response = await client.execute_query(f"""
-            SELECT a.*, 
-                  MAX(a.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-             FROM dbo.c_team_member_vw a WITH (NOEXPAND)
-            --WHERE a.modified_dttm >=  CAST('{dateTime}' AS datetime)
-            ORDER BY a.modified_dttm DESC
+            SELECT 
+                team_id client_team_id, 
+                person_id client_resource_id, 
+                CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
+             FROM dbo.c_team_member_vw WITH (NOEXPAND)
+            WHERE modified_dttm >=  CAST('{dateTime}' AS datetime)
+              AND person_type = 'TECNICO'
+            ORDER BY modified_dttm ASC
             """)
         await client.close()
 
@@ -1046,25 +788,32 @@ async def getJobTypeMatrix(dateTime: str = None, client_uid: str = None):
         )
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
-                                                        
-            select code_value, description, modified_dttm, 
-              MAX(modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-              from GLOBAL_CODE_TABLE
-              where modified_dttm >= CAST('{dateTime}' AS datetime)
-              and CODE_NAME = 'TASK_TYPE'
+            SELECT 
+                code_value client_job_type_id, 
+                description desc_job_type, 
+                CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
+              FROM dbo.GLOBAL_CODE_TABLE
+              WHERE modified_dttm >= CAST('{dateTime}' AS datetime)
+                AND CODE_NAME = 'TASK_TYPE'
                 AND ACTIVE = 'Y'
-              order by modified_dttm desc
             """)
 
         await client.close()
 
         if app_params_response.success:
-                logger.info(f"[getJobTypeMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        
-        return (result_rows)
+            logger.info(f"[getJobTypeMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getJobTypeMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getJobTypeMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getJobStatusMatrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -1079,34 +828,38 @@ async def getJobStatusMatrix(dateTime: str = None, client_uid: str = None):
         client = FSMClient(config)
         app_params_response = await client.execute_query(f"""
             SELECT 
-              t.task_status, 
+              t.task_status client_job_status_id, 
               CASE 
                   WHEN mmd.message_text IS NULL THEN t.description 
                   ELSE mmd.message_text 
-              END AS description,
-              t.item_style_id, 
-              t.modified_dttm,
-              MAX(t.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
-          FROM task_status t
+              END AS desc_job_status,
+              t.item_style_id client_style_id, 
+              CONVERT(VARCHAR(19), CAST(t.modified_dttm AS DATETIME2), 120) as modified_date
+          FROM dbo.task_status t
           LEFT JOIN metrix_message_def mmd 
               ON t.desc_message_id = mmd.message_id 
               AND mmd.locale_code = 'PT-BR' 
               AND mmd.message_type = 'CODE'
           WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
             AND t.active = 'Y'
-          ORDER BY 
-              t.modified_dttm DESC
             """)
 
         await client.close()
 
         if app_params_response.success:
-                logger.info(f"[getJobStatusMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        
-        return (result_rows)
+            logger.info(f"[getJobStatusMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getJobStatusMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getJobStatusMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getTeamMatrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -1125,29 +878,32 @@ async def getTeamMatrix(dateTime: str = None, client_uid: str = None):
 
         app_params_response = await client.execute_query(f"""
             SELECT 
-              t.team_id, 
-              t.description, 
+              t.team_id client_team_id, 
+              t.description team_name, 
               a.geocode_lat,
               a.geocode_long,
-              t.modified_dttm,
-              MAX(t.modified_dttm) OVER (PARTITION BY 1) AS last_snap 
+              CONVERT(VARCHAR(19), CAST(t.modified_dttm AS DATETIME2), 120) as modified_date
              FROM dbo.team t
               join dbo.place p on p.place_id = t.place_id
               left join dbo.place_address pa ON p.place_id = pa.place_id and pa.address_type = 'DEFAULT'
               LEFT join dbo.address a on pa.address_id  = a.address_id
              where t.modified_dttm >= CAST('{dateTime}' AS datetime)                                            
-            ORDER BY t.modified_dttm DESC
             """)
         await client.close()
-
         if app_params_response.success:
-                logger.info(f"[getTeamMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        
-        return (result_rows)
-        
+            logger.info(f"[getTeamMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getTeamMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getTeamMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getResourceWindowMatrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -1200,8 +956,9 @@ async def getPriorityMatrix(client_uid: str = None):
 
         app_params_response = await client.execute_query(f"""
             SELECT 
-              contr_type, 
-              ranking 
+              contr_type client_priority_id, 
+              ranking priority,
+             CONVERT(VARCHAR(19), CAST(getDate() AS DATETIME2), 120) modified_date
              FROM dbo.C_PRIORITY_VW
             """)
         await client.close()

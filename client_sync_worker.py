@@ -32,9 +32,9 @@ async def get_token(client_id: str = CLIENT_ID, client_secret: str = CLIENT_SECR
     return None
 
 async def getSnaps(token: str):
-    resp = httpx.get(f"{BASE_URL}/snaps", headers=auth_headers(token))
-    print(type(resp.json()))
-    return resp.json()
+    resp = httpx.get(f"{BASE_URL}/snaps", timeout=None, headers=auth_headers(token))
+    
+    return json.loads(resp.json())
 
 async def getStyle(token: str, snaps: dict):
 
@@ -47,7 +47,7 @@ async def getStyle(token: str, snaps: dict):
     if result_rows:
         try:
             print(result_rows)
-            resp = httpx.post(f"{BASE_URL}/styles", json=result_rows, headers=auth_headers(token))
+            resp = httpx.post(f"{BASE_URL}/styles", timeout=None, json=result_rows, headers=auth_headers(token))
             print(f"  Status: {resp.status_code}")
             print(f"  Resposta: {resp.json()}")
 
@@ -68,7 +68,7 @@ async def getJobs(token: str, snaps: dict):
     #   last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
       try:
           print(result_rows)
-          resp = httpx.post(f"{BASE_URL}/jobs", json=result_rows, headers=auth_headers(token))
+          resp = httpx.post(f"{BASE_URL}/jobs", timeout=None, json=result_rows, headers=auth_headers(token))
           print(f"  Status: {resp.status_code}")
           print(f"  Resposta: {resp.json()}")
 
@@ -88,7 +88,7 @@ async def getResources(token: str, snaps: dict):
     if result_rows:
       try:
           print(result_rows)
-          resp = httpx.post(f"{BASE_URL}/resources", json=result_rows, headers=auth_headers(token))
+          resp = httpx.post(f"{BASE_URL}/resources", timeout=None, json=result_rows, headers=auth_headers(token))
           print(f"  Status: {resp.status_code}")
           print(f"  Resposta: {resp.json()}")
 
@@ -108,12 +108,193 @@ async def getResourceWindows(token: str, snaps: dict):
     if result_rows:
       try:
         #   print(result_rows)
-          resp = httpx.post(f"{BASE_URL}/resource_windows", json=result_rows, headers=auth_headers(token))
+          resp = httpx.post(f"{BASE_URL}/resource_windows", timeout=None, json=result_rows, headers=auth_headers(token))
           print(f"  Status: {resp.status_code}")
           print(f"  Resposta: {resp.json()}")
 
       except Exception as e:
         logger.error(f"[getResourceWindows] Erro ao processar : {e}")
+    return
+
+async def getAddress(token: str, snaps: dict):
+
+    logger.warning("[getAddress] Entrou atualização de Endereços ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['address']
+    result_rows = await getAdressMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/address", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getAddress] Erro ao processar : {e}")
+    return
+
+async def getPlaces(token: str, snaps: dict):
+
+    logger.warning("[getPlaces] Entrou atualização dos locais ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['places']
+    result_rows = await getPlaceMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/places", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getPlaces] Erro ao processar : {e}")
+    return
+
+
+async def getTeams(token: str, snaps: dict):
+
+    logger.warning("[getTeams] Entrou atualização das Equipes ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['teams']
+    result_rows = await getTeamMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/teams", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getTeams] Erro ao processar : {e}")
+    return
+
+async def getTeamMembers(token: str, snaps: dict):
+
+    logger.warning("[getTeamMembers] Entrou atualização dos membros das equipes ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['team_members']
+    result_rows = await getTeamMemberMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/team_members", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getTeamMembers] Erro ao processar : {e}")
+    return
+
+async def getJobTypes(token: str, snaps: dict):
+
+    logger.warning("[getJobTypes] Entrou atualização dos Tipos de trabalho/Tarefa ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['job_types']
+    result_rows = await getJobTypeMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/job_types", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getJobTypes] Erro ao processar : {e}")
+    return
+
+async def getJobStatus(token: str, snaps: dict):
+
+    logger.warning("[getJobStatus] Entrou atualização da situaçao/status do trabalho/Tarefa ...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['job_status']
+    result_rows = await getJobStatusMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/job_status", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getJobStatus] Erro ao processar : {e}")
+    return
+
+async def getLogInOut(token: str, snaps: dict):
+
+    logger.warning("[getLogInOut] Entrou atualização Login...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['logintime']
+    result_rows = await getLogInOutMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/resource_logged", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getLogInOut] Erro ao processar : {e}")
+    return
+
+async def getActualGeoPos(token: str, snaps: dict):
+
+    logger.warning("[getActualGeoPos] Entrou atualização Geo Resource posicionamento...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['actual_geopos']
+    result_rows = await getGeoPosMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/resource_actual_geopos", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getActualGeoPos] Erro ao processar : {e}")
+    return
+
+async def getPriority(token: str, snaps: dict):
+
+    logger.warning("[getPriority] Entrou atualização das Prioridades...")
+
+    # tempDateTime = (datetime.now() - timedelta(days=5))
+    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
+    dateTime = snaps['priority']
+    result_rows = await getPriorityMatrix(dateTime)
+
+    if result_rows:
+      try:
+        #   print(result_rows)
+          resp = httpx.post(f"{BASE_URL}/priority", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+        logger.error(f"[getPriority] Erro ao processar : {e}")
     return
 
 async def background_process():
@@ -127,14 +308,34 @@ async def background_process():
                 token = await get_token()
                 snaps = await getSnaps(token)
                 print(snaps, type(snaps))
+                await getPriority(token, snaps)
                 # await getStyle(token, snaps)
                 # await asyncio.sleep(0.5)
                 # await getResources(token, snaps)
                 # await asyncio.sleep(0.5)
-                await getResourceWindows(token,snaps)
-
+                # await getLogInOut(token, snaps)
+                await asyncio.sleep(0.5)
+                await getActualGeoPos(token, snaps)
+                # await asyncio.sleep(0.5)
+                # await getResourceWindows(token,snaps)
+                # await asyncio.sleep(0.5)
                 # await getJobs(token, snaps)
+                # await asyncio.sleep(0.5)
+                # await getAddress(token,snaps)
+                # await asyncio.sleep(0.5)
+                # await getPlaces(token,snaps)
 
+                # await asyncio.sleep(0.5)
+                # await getTeams(token,snaps)
+
+                # await asyncio.sleep(0.5)
+                # await getTeamMembers(token,snaps)
+
+                # await asyncio.sleep(0.5)
+                # await getJobTypes(token,snaps)
+
+                # await asyncio.sleep(0.5)
+                # await getJobStatus(token,snaps)
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
                 consecutive_failures = 0
