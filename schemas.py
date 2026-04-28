@@ -63,7 +63,7 @@ class JobRescheduleResponse(BaseModel):
         from_attributes = True
 
 class ResourceUpdateRequest(BaseModel):
-    fl_off_shift: Optional[int] = None
+    off_shift_flag: Optional[int] = None
     time_setup: Optional[int] = None
     time_service: Optional[int] = None
     time_overlap: Optional[int] = None
@@ -71,7 +71,7 @@ class ResourceUpdateRequest(BaseModel):
 class ResourceUpdateResponse(BaseModel):
     resource_id: int
     client_resource_id: str
-    fl_off_shift: int
+    off_shift_flag: int
     time_setup: Optional[int]
     time_service: Optional[int]
     time_overlap: Optional[int]

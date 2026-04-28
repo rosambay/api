@@ -121,7 +121,6 @@ class Priority(Base):
     modified_by = Column(String(32), nullable=False)
     modified_date = Column(DateTime, nullable=False)
 
-
 class Styles(Base):
     __tablename__ = "styles"
     client_id = Column(Integer, ForeignKey("clients.client_id"), primary_key=True, nullable=False)
@@ -372,6 +371,7 @@ class JobStatus(Base):
             Index('idx_job_status_00', 'client_job_status_id','client_id'),
             Index('idx_job_status_01', 'modified_date','client_id')
         )
+
 class JobType(Base):
     __tablename__ = "job_types"
 

@@ -25,25 +25,6 @@ def oneHour(dateTime: str):
     nova_data_obj = data_obj - timedelta(hours=1)
     return nova_data_obj.strftime('%Y-%m-%d %H:%M:%S')
 
-async def nofifyWebSocket(r, type, data):
-    async for chave in r.scan_iter("session:*"):
-        session = chave.split(':')[1]
-        result =  await r.get(chave)
-        if result:
-            for x in json.loads(result):
-                if x['team_id'] == data.registro_json['team_id']:
-                    logger.debug(f"Enviando atualização para sessão {session} do WebSocket - Equipe: {data.registro_json['team_id']}")
-                    chave_queue = f"notify:{session}:queue"
-                    payload = {
-                        "type": type,
-                        "action": data.merge_action,
-                        "dados": data.registro_json or {}
-                    }
-                    payload_json = json.dumps(payload)
-                    await r.rpush(chave_queue, payload_json)
-                    await r.expire(chave_queue, 3600)
-                    await r.publish(f"notify:{session}:notify", "check_queue")
-
 async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
     stmt = text(f"""
         WITH dados AS (
@@ -133,12 +114,12 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
             select
             r.resource_id,
             r.description,
-            COALESCE(r.geocode_lat_from,t.geocode_lat)::NUMERIC AS geocode_lat_from,
-            COALESCE(r.geocode_long_from,t.geocode_long)::NUMERIC AS geocode_long_from,
-            COALESCE(r.geocode_lat_at,t.geocode_lat)::NUMERIC AS geocode_lat_at,
-            COALESCE(r.geocode_long_at,t.geocode_long)::NUMERIC AS geocode_long_at,
-            EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
-            EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
+            COALESCE(r.geocode_lat_start,t.geocode_lat)::NUMERIC AS geocode_lat_start,
+            COALESCE(r.geocode_long_start,t.geocode_long)::NUMERIC AS geocode_long_start,
+            COALESCE(r.geocode_lat_end,t.geocode_lat)::NUMERIC AS geocode_lat_end,
+            COALESCE(r.geocode_long_end,t.geocode_long)::NUMERIC AS geocode_long_end,
+            EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.start_time,t.start_time) else r.off_shift_start_time end ) ::INTEGER AS start_time,
+            EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.end_time,t.end_time) else r.off_shift_end_time end ) ::INTEGER AS end_time
             from resources r
             join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
             join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
@@ -150,10 +131,10 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                 s.type_resources = 'A' 
                 OR (s.type_resources = 'S' AND r.resource_id = s.resource_id)
             )
-            AND COALESCE(r.geocode_lat_from, t.geocode_lat) IS NOT NULL
-            AND COALESCE(r.geocode_long_from, t.geocode_long) IS NOT NULL
-            AND COALESCE(r.geocode_lat_at, t.geocode_lat) IS NOT NULL
-            AND COALESCE(r.geocode_long_at, t.geocode_long) IS NOT NULL
+            AND COALESCE(r.geocode_lat_start, t.geocode_lat) IS NOT NULL
+            AND COALESCE(r.geocode_long_start, t.geocode_long) IS NOT NULL
+            AND COALESCE(r.geocode_lat_end, t.geocode_lat) IS NOT NULL
+            AND COALESCE(r.geocode_long_end, t.geocode_long) IS NOT NULL
         ),
         vehicles_json AS (
         SELECT json_agg(
@@ -161,8 +142,8 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
             json_build_object(
                 'id', resource_id,
                 'description', description,
-                'start', json_build_array(geocode_long_from, geocode_lat_from),
-                'end', json_build_array(geocode_long_at, geocode_lat_at),
+                'start', json_build_array(geocode_long_start, geocode_lat_start),
+                'end', json_build_array(geocode_long_end, geocode_lat_end),
                 'time_window', json_build_array(start_time, end_time)
             ))
         ) AS array_vehicles
@@ -201,8 +182,8 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                 ,j.address_id
                 ,a.geocode_lat::NUMERIC geocode_lat
                 ,a.geocode_long::NUMERIC geocode_long
-                ,COALESCE (j.time_setup, jt.time_setup, t.time_setup) AS time_setup
-                ,COALESCE (j.time_service, jt.time_service, t.time_service) AS time_service
+                ,COALESCE (j.time_setup, jt.time_setup, t.time_setup, 0) AS time_setup
+                ,COALESCE (j.time_service, jt.time_service, t.time_service, 0) AS time_service
                 ,j.priority + (COALESCE (jt.priority, 0) / 100)::INTEGER AS priority
                 ,json_agg( 
                     json_build_array(
@@ -290,17 +271,12 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
             SELECT
                 CAST(rw.week_day*100 as text)||CAST(r.resource_id AS TEXT)::INTEGER AS resource_id,
                 r.resource_id ||':' ||rw.week_day AS description,
-                COALESCE(r.geocode_lat_from,t.geocode_lat)::NUMERIC AS geocode_lat_from,
-                COALESCE(r.geocode_long_from,t.geocode_long)::NUMERIC AS geocode_long_from,
-                COALESCE(r.geocode_lat_at,t.geocode_lat)::NUMERIC AS geocode_lat_at,
-                COALESCE(r.geocode_long_at,t.geocode_long)::NUMERIC AS geocode_long_at,
-                COALESCE(rw.start_time,t.start_time, cast('08:00:00' as time)) AS start_time,
-                CASE 
-                    WHEN r.fl_off_shift = 0 
-                    then 
-                        COALESCE(rw.end_time,t.end_time, cast('18:00:00' as time)) 
-                    else cast('23:59:59' as time) 
-                    end AS end_time,
+                COALESCE(r.geocode_lat_start,t.geocode_lat)::NUMERIC AS geocode_lat_start,
+                COALESCE(r.geocode_long_start,t.geocode_long)::NUMERIC AS geocode_long_start,
+                COALESCE(r.geocode_lat_end,t.geocode_lat)::NUMERIC AS geocode_lat_end,
+                COALESCE(r.geocode_long_end,t.geocode_long)::NUMERIC AS geocode_long_end,
+                CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.start_time,t.start_time) else r.off_shift_start_time end AS start_time,
+                CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.end_time,t.end_time) else r.off_shift_end_time end AS end_time,
                 rw.week_day-1 AS week_day
             FROM resources r
                 join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
@@ -313,19 +289,19 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                 s.type_resources = 'A' 
                 OR (s.type_resources = 'S' AND r.resource_id = s.resource_id)
             )
-            AND COALESCE(r.geocode_lat_from, t.geocode_lat) IS NOT NULL
-            AND COALESCE(r.geocode_long_from, t.geocode_long) IS NOT NULL
-            AND COALESCE(r.geocode_lat_at, t.geocode_lat) IS NOT NULL
-            AND COALESCE(r.geocode_long_at, t.geocode_long) IS NOT NULL
+            AND COALESCE(r.geocode_lat_start, t.geocode_lat) IS NOT NULL
+            AND COALESCE(r.geocode_long_start, t.geocode_long) IS NOT NULL
+            AND COALESCE(r.geocode_lat_end, t.geocode_lat) IS NOT NULL
+            AND COALESCE(r.geocode_long_end, t.geocode_long) IS NOT NULL
         ),
         vehicles_data AS (
             SELECT 
                 resource_id::INTEGER AS resource_id,
                 description,
-                geocode_lat_from,
-                geocode_long_from,
-                geocode_lat_at,
-                geocode_long_at,
+                geocode_lat_start,
+                geocode_long_start,
+                geocode_lat_end,
+                geocode_long_end,
                 (EXTRACT(EPOCH FROM (date_trunc('day', now())::date + (week_day - EXTRACT(DOW FROM date_trunc('day', now()))::int)) AT TIME ZONE 'UTC')
                     + EXTRACT(EPOCH FROM start_time) )::INTEGER AS start_time,
                 (EXTRACT(EPOCH FROM (date_trunc('day', now())::date + (week_day - EXTRACT(DOW FROM date_trunc('day', now()))::int)) AT TIME ZONE 'UTC')
@@ -338,8 +314,8 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
             json_build_object(
                 'id', resource_id,
                 'description', description,
-                'start', json_build_array(geocode_long_from, geocode_lat_from),
-                'end', json_build_array(geocode_long_at, geocode_lat_at),
+                'start', json_build_array(geocode_long_start, geocode_lat_start),
+                'end', json_build_array(geocode_long_end, geocode_lat_end),
                 'time_window', json_build_array(start_time, end_time)
             ))
         ) AS array_vehicles
@@ -491,14 +467,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                 j.trade_name, 
                 j.cnpj,
                 j.job_day,
-                q_1.geocode_long AS geocode_long_from,
-                q_1.geocode_lat AS  geocode_lat_from,
+                q_1.geocode_long AS geocode_long_start,
+                q_1.geocode_lat AS  geocode_lat_start,
                 q_1.arrival AS arrival_from,
                 q_3.distance AS distance_from,
                 q_3.time_distance as time_distance_from,
                 
-                q_2.geocode_long AS geocode_long_at,
-                q_2.geocode_lat AS  geocode_lat_at,
+                q_2.geocode_long AS geocode_long_end,
+                q_2.geocode_lat AS  geocode_lat_end,
                 q_2.arrival AS arrival_at,
                 q_2.distance AS distance_at,
                 q_2.time_distance as time_distance_at,
@@ -558,14 +534,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                 q.client_resource_id,
                 q.resource_name,
                 q.job_day,
-                q.geocode_long_from,
-                q.geocode_lat_from,
+                q.geocode_long_start,
+                q.geocode_lat_start,
                 q.distance_from,
                 q.time_distance_from,
                 q.arrival_from,
                 q.date_from,
-                q.geocode_long_at,
-                q.geocode_lat_at,
+                q.geocode_long_end,
+                q.geocode_lat_end,
                 q.distance_at,
                 q.time_distance_at,
                 q.arrival_at,
@@ -610,14 +586,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                     'client_resource_id', client_resource_id,
                     'resource_name', resource_name,
                     'job_day', job_day,
-                    'geocode_long_from', geocode_long_from,
-                    'geocode_lat_from', geocode_lat_from,
+                    'geocode_long_start', geocode_long_start,
+                    'geocode_lat_start', geocode_lat_start,
                     'distance_from', distance_from,
                     'time_distance_from', time_distance_from,
                     'arrival_from', arrival_from,
                     'date_from', date_from,
-                    'geocode_long_at', geocode_long_at,
-                    'geocode_lat_at', geocode_lat_at,
+                    'geocode_long_end', geocode_long_end,
+                    'geocode_lat_end', geocode_lat_end,
                     'distance_at', distance_at,
                     'time_distance_at', time_distance_at,
                     'arrival_at', arrival_at,
@@ -717,14 +693,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                     j.trade_name, 
                     j.cnpj,
                     q.job_day,
-                    q_1.geocode_long AS geocode_long_from,
-                    q_1.geocode_lat AS  geocode_lat_from,
+                    q_1.geocode_long AS geocode_long_start,
+                    q_1.geocode_lat AS  geocode_lat_start,
                     q_1.arrival AS arrival_from,
                     q_3.distance AS distance_from,
                     q_3.time_distance as time_distance_from,
                     
-                    q_2.geocode_long AS geocode_long_at,
-                    q_2.geocode_lat AS  geocode_lat_at,
+                    q_2.geocode_long AS geocode_long_end,
+                    q_2.geocode_lat AS  geocode_lat_end,
                     q_2.arrival AS arrival_at,
                     q_2.distance AS distance_at,
                     q_2.time_distance as time_distance_at,
@@ -784,14 +760,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                     q.client_resource_id,
                     q.resource_name,
                     q.job_day,
-                    q.geocode_long_from,
-                    q.geocode_lat_from,
+                    q.geocode_long_start,
+                    q.geocode_lat_start,
                     q.distance_from,
                     q.time_distance_from,
                     q.arrival_from,
                     q.date_from,
-                    q.geocode_long_at,
-                    q.geocode_lat_at,
+                    q.geocode_long_end,
+                    q.geocode_lat_end,
                     q.distance_at,
                     q.time_distance_at,
                     q.arrival_at,
@@ -837,14 +813,14 @@ async def calc_rote(clientId, teamId, userId, scheduleId, frequency='DAILY'):
                         'client_resource_id', client_resource_id,
                         'resource_name', resource_name,
                         'job_day', job_day,
-                        'geocode_long_from', geocode_long_from,
-                        'geocode_lat_from', geocode_lat_from,
+                        'geocode_long_start', geocode_long_start,
+                        'geocode_lat_start', geocode_lat_start,
                         'distance_from', distance_from,
                         'time_distance_from', time_distance_from,
                         'arrival_from', arrival_from,
                         'date_from', date_from,
-                        'geocode_long_at', geocode_long_at,
-                        'geocode_lat_at', geocode_lat_at,
+                        'geocode_long_end', geocode_long_end,
+                        'geocode_lat_end', geocode_lat_end,
                         'distance_at', distance_at,
                         'time_distance_at', time_distance_at,
                         'arrival_at', arrival_at,
@@ -946,22 +922,22 @@ async def checkPendencias(r):
 
         stmt = text("""
             UPDATE resources 
-                set geocode_lat_from = NULL,
-                    geocode_long_from = NULL,
-                    geocode_long_at = NULL,
-                    geocode_lat_at = NULL
-            WHERE  COALESCE(geocode_lat_from::NUMERIC, 0) = 0  
-                OR COALESCE(geocode_long_from::NUMERIC,0) = 0
-                OR geocode_lat_from::NUMERIC < -40 
-                OR geocode_lat_from::NUMERIC > 10
-                OR geocode_long_from::NUMERIC < -80 
-                OR geocode_long_from::NUMERIC > -30
-                OR COALESCE(geocode_lat_at::NUMERIC, 0) = 0  
-                OR COALESCE(geocode_long_at::NUMERIC, 0) = 0
-                OR geocode_lat_at::NUMERIC < -40 
-                OR geocode_lat_at::NUMERIC > 10
-                OR geocode_long_at::NUMERIC < -80 
-                OR geocode_long_at::NUMERIC > -30;
+                set geocode_lat_start = NULL,
+                    geocode_long_start = NULL,
+                    geocode_long_end = NULL,
+                    geocode_lat_end = NULL
+            WHERE  COALESCE(geocode_lat_start::NUMERIC, 0) = 0  
+                OR COALESCE(geocode_long_start::NUMERIC,0) = 0
+                OR geocode_lat_start::NUMERIC < -40 
+                OR geocode_lat_start::NUMERIC > 10
+                OR geocode_long_start::NUMERIC < -80 
+                OR geocode_long_start::NUMERIC > -30
+                OR COALESCE(geocode_lat_end::NUMERIC, 0) = 0  
+                OR COALESCE(geocode_long_end::NUMERIC, 0) = 0
+                OR geocode_lat_end::NUMERIC < -40 
+                OR geocode_lat_end::NUMERIC > 10
+                OR geocode_long_end::NUMERIC < -80 
+                OR geocode_long_end::NUMERIC > -30;
         """)
         async with SessionLocal() as db:
             result = await db.execute(stmt)
@@ -1146,10 +1122,10 @@ async def buildAdjustmentScheduled():
                         select
                             r.resource_id,
                             r.description,
-                            COALESCE(l.geocode_lat,r.geocode_lat_from)::NUMERIC as geocode_lat_from,
-                            COALESCE(l.geocode_long,r.geocode_long_from)::NUMERIC as geocode_long_from,
-                            r.geocode_lat_at::NUMERIC,
-                            r.geocode_long_at::NUMERIC,
+                            COALESCE(l.geocode_lat,r.geocode_lat_start)::NUMERIC as geocode_lat_start,
+                            COALESCE(l.geocode_long,r.geocode_long_start)::NUMERIC as geocode_long_start,
+                            r.geocode_lat_end::NUMERIC,
+                            r.geocode_long_end::NUMERIC,
                             CASE WHEN l.actual_end_date IS NULL THEN
                                 EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER
                             ELSE
@@ -1172,8 +1148,8 @@ async def buildAdjustmentScheduled():
                                 json_build_object(
                                     'id', resource_id,
                                     'description', description,
-                                    'start', json_build_array(geocode_long_from, geocode_lat_from),
-                                    'end', json_build_array(geocode_long_at, geocode_lat_at),
+                                    'start', json_build_array(geocode_long_start, geocode_lat_start),
+                                    'end', json_build_array(geocode_long_end, geocode_lat_end),
                                     'time_window', json_build_array(start_time, end_time)
                                 ))
                             ) AS array_vehicles
@@ -1330,14 +1306,14 @@ async def buildAdjustmentScheduled():
                             j.trade_name, 
                             j.cnpj,
                             :p_date job_day,
-                            q_1.geocode_long AS geocode_long_from,
-                            q_1.geocode_lat AS  geocode_lat_from,
+                            q_1.geocode_long AS geocode_long_start,
+                            q_1.geocode_lat AS  geocode_lat_start,
                             q_1.arrival AS arrival_from,
                             q_3.distance AS distance_from,
                             q_3.time_distance as time_distance_from,
                             
-                            q_2.geocode_long AS geocode_long_at,
-                            q_2.geocode_lat AS  geocode_lat_at,
+                            q_2.geocode_long AS geocode_long_end,
+                            q_2.geocode_lat AS  geocode_lat_end,
                             q_2.arrival AS arrival_at,
                             q_2.distance AS distance_at,
                             q_2.time_distance as time_distance_at,
@@ -1492,22 +1468,22 @@ async def _calc_bra_report(clientId: int, teamId: int, actualDate, r: str):
                             select
                                 r.resource_id,
                                 r.description,
-                                COALESCE(r.geocode_lat_from,t.geocode_lat)::NUMERIC AS geocode_lat_from,
-                                COALESCE(r.geocode_long_from,t.geocode_long)::NUMERIC AS geocode_long_from,
-                                COALESCE(r.geocode_lat_at,t.geocode_lat)::NUMERIC AS geocode_lat_at,
-                                COALESCE(r.geocode_long_at,t.geocode_long)::NUMERIC AS geocode_long_at,
-                                EXTRACT(EPOCH FROM COALESCE(rw.start_time,t.start_time)) ::INTEGER AS start_time,
-                                EXTRACT(EPOCH FROM CASE WHEN r.fl_off_shift = 0 then COALESCE(rw.end_time,t.end_time) else cast('23:59:59' as time) end ) ::INTEGER AS end_time
+                                COALESCE(r.geocode_lat_start,t.geocode_lat)::NUMERIC AS geocode_lat_start,
+                                COALESCE(r.geocode_long_start,t.geocode_long)::NUMERIC AS geocode_long_start,
+                                COALESCE(r.geocode_lat_end,t.geocode_lat)::NUMERIC AS geocode_lat_end,
+                                COALESCE(r.geocode_long_end,t.geocode_long)::NUMERIC AS geocode_long_end,
+                                EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.start_time,t.start_time) else r.off_shift_start_time end ) ::INTEGER AS start_time,
+                                EXTRACT(EPOCH FROM CASE WHEN r.off_shift_flag = 0 then COALESCE(rw.end_time,t.end_time) else r.off_shift_end_time end ) ::INTEGER AS end_time
                             from resources r
                                 join team_members tm on tm.client_id = r.client_id and tm.resource_id = r.resource_id
                                 join teams t on t.client_id = tm.client_id and t.team_id = tm.team_id
                                 LEFT JOIN resource_windows rw on rw.client_id = r.client_id and rw.resource_id = r.resource_id and rw.week_day = EXTRACT(DOW FROM :p_date) + 1
                             where r.client_id = :client_id
                                 and t.team_id = :team_id
-                                AND COALESCE(r.geocode_lat_from, t.geocode_lat) IS NOT NULL
-                                AND COALESCE(r.geocode_long_from, t.geocode_long) IS NOT NULL
-                                AND COALESCE(r.geocode_lat_at, t.geocode_lat) IS NOT NULL
-                                AND COALESCE(r.geocode_long_at, t.geocode_long) IS NOT NULL
+                                AND COALESCE(r.geocode_lat_start, t.geocode_lat) IS NOT NULL
+                                AND COALESCE(r.geocode_long_start, t.geocode_long) IS NOT NULL
+                                AND COALESCE(r.geocode_lat_end, t.geocode_lat) IS NOT NULL
+                                AND COALESCE(r.geocode_long_end, t.geocode_long) IS NOT NULL
                                 {vBrac if r =='BRAC' else ''}
                         ),
                         vehicles_json AS (
@@ -1516,8 +1492,8 @@ async def _calc_bra_report(clientId: int, teamId: int, actualDate, r: str):
                             json_build_object(
                                 'id', resource_id,
                                 'description', description,
-                                'start', json_build_array(geocode_long_from, geocode_lat_from),
-                                'end', json_build_array(geocode_long_at, geocode_lat_at),
+                                'start', json_build_array(geocode_long_start, geocode_lat_start),
+                                'end', json_build_array(geocode_long_end, geocode_lat_end),
                                 'time_window', json_build_array(start_time, end_time)
                             ))
                         ) AS array_vehicles
@@ -1669,13 +1645,13 @@ async def _calc_bra_report(clientId: int, teamId: int, actualDate, r: str):
                     j.trade_name,
                     j.cnpj,
                     :p_date job_day,
-                    q_1.geocode_long AS geocode_long_from,
-                    q_1.geocode_lat AS geocode_lat_from,
+                    q_1.geocode_long AS geocode_long_start,
+                    q_1.geocode_lat AS geocode_lat_start,
                     q_1.arrival AS arrival_from,
                     q_3.distance AS distance_from,
                     q_3.time_distance as time_distance_from,
-                    q_2.geocode_long AS geocode_long_at,
-                    q_2.geocode_lat AS geocode_lat_at,
+                    q_2.geocode_long AS geocode_long_end,
+                    q_2.geocode_lat AS geocode_lat_end,
                     q_2.arrival AS arrival_at,
                     q_2.distance AS distance_at,
                     q_2.time_distance as time_distance_at,
@@ -1721,14 +1697,14 @@ async def _calc_bra_report(clientId: int, teamId: int, actualDate, r: str):
                     q.client_resource_id,
                     q.resource_name,
                     q.job_day,
-                    q.geocode_long_from,
-                    q.geocode_lat_from,
+                    q.geocode_long_start,
+                    q.geocode_lat_start,
                     q.distance_from,
                     q.time_distance_from,
                     q.arrival_from,
                     q.date_from,
-                    q.geocode_long_at,
-                    q.geocode_lat_at,
+                    q.geocode_long_end,
+                    q.geocode_lat_end,
                     q.distance_at,
                     q.time_distance_at,
                     q.arrival_at,
@@ -1773,14 +1749,14 @@ async def _calc_bra_report(clientId: int, teamId: int, actualDate, r: str):
                         'client_resource_id', client_resource_id,
                         'resource_name', resource_name,
                         'job_day', job_day,
-                        'geocode_long_from', geocode_long_from,
-                        'geocode_lat_from', geocode_lat_from,
+                        'geocode_long_start', geocode_long_start,
+                        'geocode_lat_start', geocode_lat_start,
                         'distance_from', distance_from,
                         'time_distance_from', time_distance_from,
                         'arrival_from', arrival_from,
                         'date_from', date_from,
-                        'geocode_long_at', geocode_long_at,
-                        'geocode_lat_at', geocode_lat_at,
+                        'geocode_long_end', geocode_long_end,
+                        'geocode_lat_end', geocode_lat_end,
                         'distance_at', distance_at,
                         'time_distance_at', time_distance_at,
                         'arrival_at', arrival_at,
@@ -1840,10 +1816,10 @@ async def _calc_real_report(clientId: int, teamId: int, actualDate):
                     p.trade_name,
                     p.cnpj,
                     date_trunc('day',COALESCE(j.actual_start_date,j.plan_start_date)) job_day,
-                    r.geocode_long_from,
-                    r.geocode_lat_from,
-                    r.geocode_long_at,
-                    r.geocode_lat_at,
+                    r.geocode_long_start,
+                    r.geocode_lat_start,
+                    r.geocode_long_end,
+                    r.geocode_lat_end,
                     FIRST_VALUE(COALESCE(j.actual_start_date,j.plan_start_date)) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, date_trunc('day',COALESCE(j.actual_start_date,j.plan_start_date)) ORDER BY COALESCE(j.actual_start_date,j.plan_start_date) ASC ) first_start_date,
                     FIRST_VALUE(COALESCE(j.actual_end_date,j.plan_end_date)) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, date_trunc('day',COALESCE(j.actual_end_date,j.plan_end_date)) ORDER BY COALESCE(j.actual_end_date,j.plan_end_date) DESC ) last_end_date,
                     j.first_distance AS distance_from,
@@ -1893,14 +1869,14 @@ async def _calc_real_report(clientId: int, teamId: int, actualDate):
                     d.client_resource_id,
                     d.resource_name,
                     d.job_day,
-                    d.geocode_long_from,
-                    d.geocode_lat_from,
+                    d.geocode_long_start,
+                    d.geocode_lat_start,
                     d.distance_from,
                     d.time_distance_from,
                     d.arrival_from,
                     d.date_from,
-                    d.geocode_long_at,
-                    d.geocode_lat_at,
+                    d.geocode_long_end,
+                    d.geocode_lat_end,
                     d.distance_at,
                     d.time_distance_at,
                     d.arrival_at,
@@ -1936,9 +1912,9 @@ async def _calc_real_report(clientId: int, teamId: int, actualDate):
                 from dados_calc d
                 GROUP BY
                     d.client_id, d.resource_id, d.client_resource_id, d.resource_name,
-                    d.job_day, d.geocode_long_from, d.geocode_lat_from,
+                    d.job_day, d.geocode_long_start, d.geocode_lat_start,
                     d.distance_from, d.time_distance_from, d.arrival_from, d.date_from,
-                    d.geocode_long_at, d.geocode_lat_at, d.distance_at,
+                    d.geocode_long_end, d.geocode_lat_end, d.distance_at,
                     d.time_distance_at, d.arrival_at, d.date_at
             )
             select
@@ -1949,14 +1925,14 @@ async def _calc_real_report(clientId: int, teamId: int, actualDate):
                         'client_resource_id', client_resource_id,
                         'resource_name', resource_name,
                         'job_day', job_day,
-                        'geocode_long_from', geocode_long_from,
-                        'geocode_lat_from', geocode_lat_from,
+                        'geocode_long_start', geocode_long_start,
+                        'geocode_lat_start', geocode_lat_start,
                         'distance_from', distance_from,
                         'time_distance_from', time_distance_from,
                         'arrival_from', arrival_from,
                         'date_from', date_from,
-                        'geocode_long_at', geocode_long_at,
-                        'geocode_lat_at', geocode_lat_at,
+                        'geocode_long_end', geocode_long_end,
+                        'geocode_lat_end', geocode_lat_end,
                         'distance_at', distance_at,
                         'time_distance_at', time_distance_at,
                         'arrival_at', arrival_at,
@@ -2091,1223 +2067,6 @@ async def buildReports(clientId: int, r):
         logger.error(f"Erro {e}")
         logger.error(f"Detalhes: {detalhes.filename}, {detalhes.lineno} , {detalhes.name}")
 
-async def calcDistance(r):
-    try:
-        logger.warning('Iniciando cálculo de distâncias...')
-    #vamos verificar se existe alguma tarefa concluida sem distância calculada
-        stmt = text("""
-        WITH q1 AS 
-        (
-            SELECT 
-                j.client_id,
-                j.team_id,
-                j.resource_id,
-                j.actual_start_date,
-                j.plan_start_date,
-                DATE_TRUNC('day',COALESCE(j.actual_start_date, j.plan_start_date)) AS fix_start_date,
-                CASE 
-                    WHEN j.actual_start_date IS NOT NULL AND j.actual_end_date IS NOT NULL
-                        THEN
-                            CAST(EXTRACT(EPOCH FROM (j.actual_end_date - j.actual_start_date)) AS INTEGER)
-                    ELSE
-                            CAST(EXTRACT(EPOCH FROM (j.plan_end_date - j.plan_start_date)) AS INTEGER)
-                END AS duration,
-                a.geocode_long,
-                a.geocode_lat,
-                -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de chegada
-                CASE 
-                    WHEN r.geocode_lat_at IS NULL 
-                    THEN 
-                        FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
-                    ELSE 
-                    r.geocode_lat_at 
-                END AS geocode_lat_at,
-                CASE 
-                    WHEN r.geocode_long_at IS NULL 
-                    THEN 
-                        FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
-                    ELSE 
-                    r.geocode_long_at 
-                END AS geocode_long_at,
-                -- Verifica se o ponto de chegada do recurso é nulo, se for, não tem ponto de partida
-                CASE 
-                    WHEN r.geocode_lat_from IS NULL 
-                    THEN 
-                        FIRST_VALUE(a.geocode_lat) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
-                    ELSE 
-                    r.geocode_lat_from 
-                END AS geocode_lat_from,
-                CASE 
-                    WHEN r.geocode_long_from IS NULL 
-                    THEN 
-                        FIRST_VALUE(a.geocode_long) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', j.actual_start_date) ORDER BY j.actual_start_date ASC )
-                    ELSE 
-                    r.geocode_long_from 
-                END AS geocode_long_from,
-                --verifica se existe algum distance nulo no periodo, então processa
-                bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date,j.plan_start_date))) AS null_distance,
-                --verifica se existe algum geocode está vazio e não processa
-                bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date,j.plan_start_date))) AS null_geo
-            FROM jobs j
-                JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-                JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                JOIN teams t ON t.client_id = j.client_id AND t.team_id = j.team_id
-                JOIN resources r on r.client_id = j.client_id AND r.resource_id = j.resource_id
-                /*LEFT JOIN LATERAL (
-                        SELECT a2.geocode_lat, a2.geocode_long
-                            FROM jobs j2
-                            JOIN address a2 ON a2.client_id = j2.client_id AND a2.address_id = j2.address_id
-                            WHERE j2.actual_start_date < j.actual_start_date
-                            AND j2.actual_start_date >= DATE_TRUNC('day', j.actual_start_date)
-                            AND j2.job_status_id = j.job_status_id
-                            AND j2.team_id = j.team_id
-                            AND j2.client_id = j.client_id
-                            AND j2.resource_id = j.resource_id
-                            ORDER BY j2.actual_start_date DESC
-                            LIMIT 1
-                        ) jl ON true*/
-            WHERE js.internal_code_status = 'CONCLU'
-            order by j.client_id, j.team_id, j.resource_id, j.actual_start_date nulls last, j.plan_start_date
-        )
-        SELECT
-            q1.client_id,
-            q1.team_id,
-            q1.resource_id,
-            q1.fix_start_date,
-            (
-            jsonb_build_array(jsonb_build_array(MAX(q1.geocode_long_from)::NUMERIC, MAX(q1.geocode_lat_from)::NUMERIC))
-            ||
-            jsonb_agg(jsonb_build_array(q1.geocode_long::NUMERIC, q1.geocode_lat::NUMERIC) ORDER BY q1.actual_start_date nulls last, q1.plan_start_date) 
-            || 
-            jsonb_build_array(jsonb_build_array(MAX(q1.geocode_long_at)::NUMERIC, MAX(q1.geocode_lat_at)::NUMERIC))
-            ) AS rota_completa
-         FROM q1
-        WHERE null_distance = true
-          AND null_geo = false
-        GROUP BY q1.client_id, q1.team_id, q1.resource_id, q1.fix_start_date
-        ORDER BY q1.client_id, q1.team_id, q1.resource_id, q1.fix_start_date;
-        """)
-        async with SessionLocal() as db:
-            result = await db.execute(stmt)
-            rows = result.mappings().all()
-
-        if not rows:
-            semaforo_key = f'semaforo:{settings.client_uid}'
-            semaforo_raw = await r.get(semaforo_key)
-            semaforo = json.loads(semaforo_raw) if semaforo_raw else {}
-            semaforo['calc_distance'] = 'Y'
-            await r.set(semaforo_key, json.dumps(semaforo))
-            return
-
-        logger.warning(f'Calculando distâncias para {len(rows)} rotas em paralelo...')
-        geo_results = await asyncio.gather(
-            *[get_route_distance_block(row.rota_completa) for row in rows]
-        )
-
-        merge_stmt = text("""
-            MERGE INTO jobs AS u
-                USING (
-                    WITH qjson AS
-                    (
-                        SELECT
-                            y.*,
-                            FIRST_VALUE(distance) OVER (ORDER BY linha ASC) AS first_distance,
-                            FIRST_VALUE(distance) OVER (ORDER BY linha DESC) AS last_distance,
-                            FIRST_VALUE(duration) OVER (ORDER BY linha ASC) AS first_duration,
-                            FIRST_VALUE(duration) OVER (ORDER BY linha DESC) AS last_duration
-                         FROM (
-                            SELECT
-                                ROW_NUMBER() over() linha,
-                                x.*
-                              FROM
-                                jsonb_to_recordset(:dados_json)
-                                AS x(
-                                    duration NUMERIC,
-                                    distance NUMERIC)
-                            ) y order by linha ASC
-                    ),
-                    q1 as
-                    (
-                        select
-                            ROW_NUMBER() over() linha,
-                            j.*
-                        from (
-                            select j.client_id, j.job_id, a.geocode_lat, a.geocode_long, j.actual_start_date,
-                                bool_or(j.distance IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date,j.plan_start_date))) AS null_distance,
-                                bool_or(a.geocode_long IS NULL OR a.geocode_lat IS NULL) OVER (PARTITION BY j.client_id, j.team_id, j.resource_id, DATE_TRUNC('day', COALESCE(j.actual_start_date,j.plan_start_date))) AS null_geo
-                             FROM jobs j
-                                JOIN address a ON a.client_id = j.client_id AND a.address_id = j.address_id
-                                JOIN job_status js ON js.client_id = j.client_id AND js.job_status_id = j.job_status_id
-                                JOIN resources r on r.client_id = j.client_id AND r.resource_id = j.resource_id
-                            WHERE COALESCE(j.actual_start_date,j.plan_start_date) >= :p_date
-                            AND COALESCE(j.actual_start_date,j.plan_start_date) < :p_date + interval '1 day'
-                            AND js.internal_code_status = 'CONCLU'
-                            AND j.client_id = :client_id
-                            AND j.team_id = :team_id
-                            AND j.resource_id = :resource_id
-                        order by j.actual_start_date nulls last, j.plan_start_date) j
-                    ),
-                    qjob as (
-                        select *
-                          from q1
-                         where null_distance = true
-                           AND null_geo = false
-                    )
-                    SELECT b.client_id, b.job_id, a.distance, a.duration, a.last_distance, a.last_duration, a.first_distance, a.first_duration
-                      FROM qjson a
-                      join qjob b on b.linha = a.linha) as t
-            ON u.client_id = t.client_id AND u.job_id = t.job_id
-            WHEN MATCHED THEN
-            UPDATE SET
-                distance = t.distance
-                ,time_distance = t.duration
-                ,first_distance = t.first_distance
-                ,first_time_distance = t.first_duration
-                ,last_distance = t.last_distance
-                ,last_time_distance = t.last_duration
-            RETURNING
-                  to_jsonb(u) AS registro_json
-            """)
-
-        async with SessionLocal() as db:
-            for row, geoResult in zip(rows, geo_results):
-                clientId = row.client_id
-                logger.info(f'Aplicando distância: clientId={clientId}, teamId={row.team_id}, resourceId={row.resource_id}, date={row.fix_start_date}')
-                asyncio.create_task(logs(clientId=clientId, log='Resultado do distance', logJson=geoResult))
-
-                merge_result = await db.execute(merge_stmt, {
-                    "client_id": clientId,
-                    "team_id": row.team_id,
-                    "p_date": row.fix_start_date,
-                    "resource_id": row.resource_id,
-                    "dados_json": json.dumps(geoResult),
-                })
-                merge_rows = merge_result.mappings().all()
-                asyncio.create_task(logs(clientId=clientId, log='Resultado do MERGE distance', logJson=[dict(r) for r in merge_rows]))
-
-            await db.commit()
-
-        semaforo_key = f'semaforo:{settings.client_uid}'
-        semaforo_raw = await r.get(semaforo_key)
-        semaforo = json.loads(semaforo_raw) if semaforo_raw else {}
-        semaforo['calc_distance'] = 'Y'
-        await r.set(semaforo_key, json.dumps(semaforo))
-    except Exception as e:
-        logger.error(f"[calcDistance] Erro ao processar postgres: {e}")          
-
-async def getStyle(r):
-    logger.warning("[getStyle] Entrou atualização de estilos...")
-
-    snapKey = f'snapStyleTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getStyleMetrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO styles AS u
-                  USING (SELECT
-                          x.item_style_id,
-                          x.font_weight,
-                          COALESCE(x.background, '#FFFFFF') AS background,
-                          COALESCE(x.foreground, '#000000') AS foreground,
-                          x.modified_dttm,
-                          x.last_snap
-                          FROM jsonb_to_recordset(:dados_json)
-                            AS x( item_style_id text,
-                                  font_weight text,
-                                  background text,
-                                  foreground text,
-                                  modified_dttm TIMESTAMP,
-                                  last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_style_id = t.item_style_id
-                  WHEN MATCHED AND (
-                                 u.font_weight IS DISTINCT FROM t.font_weight
-                              OR u.background IS DISTINCT FROM t.background
-                              OR u.foreground IS DISTINCT FROM t.foreground
-                              )  THEN
-                      UPDATE SET font_weight = t.font_weight
-                          ,background = t.background
-                          ,foreground = t.foreground
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, client_style_id, font_weight, background, foreground, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.item_style_id, t.font_weight, t.background, t.foreground,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
-                  RETURNING
-                      u.style_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.style_id} | Ação STYLE realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-          except Exception as e:
-                    logger.error(f"Erro ao processar postgres: {e}")
-
-    return
-
-async def getResources(r):
-    logger.warning("[getResources] Entrou atualização dos Recursos ...")
-
-    snapKey = f'snapResourceTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getResourcesMatrix(dateTime, settings.client_uid)
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO resources AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              person_id text,
-                              name text,
-                              geocode_lat text,
-                              geocode_long text,
-                              geocode_lat_from text,
-                              geocode_long_from text,
-                              geocode_lat_at text,
-                              work_status integer,
-                              geocode_long_at text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_resource_id = t.person_id
-                  WHEN MATCHED AND (
-                                 u.actual_geocode_lat IS DISTINCT FROM t.geocode_lat
-                              OR u.actual_geocode_long IS DISTINCT FROM t.geocode_long
-                              OR u.geocode_lat_from IS DISTINCT FROM t.geocode_lat_from
-                              OR u.geocode_long_from IS DISTINCT FROM t.geocode_long_from
-                              OR u.geocode_lat_at IS DISTINCT FROM t.geocode_lat_at
-                              --OR u.fl_off_shift IS DISTINCT FROM t.work_status
-                              OR u.geocode_long_at IS DISTINCT FROM t.geocode_long_at
-                              OR u.description IS DISTINCT FROM t.name
-                              )  THEN
-                      UPDATE SET actual_geocode_lat = t.geocode_lat
-                          ,actual_geocode_long = t.geocode_long
-                          ,geocode_lat_from = t.geocode_lat_from
-                          ,geocode_long_from = t.geocode_long_from
-                          ,geocode_lat_at = t.geocode_lat_at
-                          ,geocode_long_at = t.geocode_long_at
-                          ,description = t.name
-                          --,fl_off_shift = t.work_status --Voltar quando decidir se vai ser pelo cliente
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.person_id, t.name, t.work_status, t.geocode_lat, t.geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
-                  RETURNING
-                       u.resource_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.resource_id} | Ação RESOURCE GEO realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getResource] Erro ao processar postgres: {e}")
-
-    return
-
-async def getResourceWindow(r):
-    logger.warning("[getResourceWindow] Entrou atualização das Janelas de Recursos ...")
-
-    snapKey = f'snapResourceWindowTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getResourceWindowMatrix(dateTime, settings.client_uid)
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-
-              stmt = text(f"""
-                  MERGE INTO resource_windows AS u
-                  USING (SELECT
-                            x.person_id,
-                            x.work_cal_time_id,
-                            r.resource_id,
-                            cast(x.day_code as integer) as day_code,
-                            x.description,
-                            cast(x.start_tm as time) as start_tm,
-                            cast(x.stop_tm as time) as stop_tm,
-                            x.modified_dttm,
-                            x.last_snap
-                          FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              person_id text,
-                              work_cal_time_id text,
-                              day_code text,
-                              description text,
-                              start_tm TIMESTAMP,
-                              stop_tm TIMESTAMP,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)
-                          JOIN resources r ON r.client_resource_id = x.person_id AND r.client_id = :client_id
-                          ) AS t
-                  ON u.client_id = :client_id
-                          AND u.resource_id = t.resource_id
-                          AND u.client_rw_id = t.work_cal_time_id
-                  WHEN MATCHED AND (
-                              u.description IS DISTINCT FROM t.description
-                              OR u.start_time IS DISTINCT FROM t.start_tm
-                              OR u.end_time IS DISTINCT FROM t.stop_tm
-                              OR u.week_day IS DISTINCT FROM t.day_code
-                              )  THEN
-                      UPDATE SET description = t.description
-                          ,start_time = t.start_tm
-                          ,end_time = t.stop_tm
-                          ,week_day = t.day_code
-                          ,modified_date = t.modified_dttm
-                          ,modified_by = 'INTEGRATION'
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, resource_id, client_rw_id, description, start_time, end_time, week_day, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.resource_id, t.work_cal_time_id, t.description, t.start_tm, t.stop_tm, t.day_code,'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
-                  RETURNING
-                       u.rw_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.rw_id} | Ação RESOURCE WINDOW realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getResourceWindow] Erro ao processar postgres: {e}")
-
-    return
-
-async def getAddress(r):
-    logger.warning("[getAddress] Entrou atualização de Endereços ...")
-
-    snapKey = f'snapAddressTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getAdressMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO address AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              address_id text,
-                              address text,
-                              geocode_lat text,
-                              geocode_long text,
-                              city text,
-                              state_prov text,
-                              zippost text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_address_id = t.address_id
-                  WHEN MATCHED AND (
-                                 u.geocode_lat IS DISTINCT FROM COALESCE(t.geocode_lat,u.geocode_lat)
-                              OR u.address IS DISTINCT FROM t.address
-                              OR u.geocode_long IS DISTINCT FROM COALESCE(t.geocode_long,u.geocode_long)
-                              OR u.city IS DISTINCT FROM t.city
-                              OR u.state_prov IS DISTINCT FROM t.state_prov
-                              OR u.zippost IS DISTINCT FROM t.zippost
-                              )  THEN
-                      UPDATE SET geocode_lat = COALESCE(t.geocode_lat,u.geocode_lat)
-                          ,geocode_long = COALESCE(t.geocode_long,u.geocode_long)
-                          ,address = t.address
-                          ,city = t.city
-                          ,state_prov = t.state_prov
-                          ,zippost = t.zippost
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  RETURNING
-                      u.address_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.address_id} | Ação ADDRESS realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getAddress] Erro ao processar postgres: {e}")
-
-    return
-
-async def getPlaces(r):
-    logger.info("[getPlaces] Entrou atualização de Locais ...")
-
-    snapKey = f'snapPlaceTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getPlaceMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO places AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              place_id text,
-                              trade_name text,
-                              cnpj text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_place_id = t.place_id
-                  WHEN MATCHED AND (
-                                 u.trade_name IS DISTINCT FROM t.trade_name
-                              OR u.cnpj IS DISTINCT FROM t.cnpj
-                              )  THEN
-                      UPDATE SET trade_name = t.trade_name
-                          ,cnpj = t.cnpj
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  RETURNING
-                      u.place_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.place_id} | Ação PLACE realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getPlaces] Erro ao processar postgres: {e}")
-
-    return
-
-async def getGeoPos(r):
-    logger.warning("[getGeoPos] Entrou atualização Geo Resource posicionamento...")
-
-    snapKey = f'snapGeoTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getGeoPosMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO resources AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              modified_by text,
-                              geocode_lat text,
-                              geocode_long text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_resource_id = t.modified_by
-                  WHEN MATCHED AND (
-                                 u.actual_geocode_lat IS DISTINCT FROM t.geocode_lat
-                              OR u.actual_geocode_long IS DISTINCT FROM t.geocode_long
-                              ) AND u.modified_date_geo < t.modified_dttm
-
-                          THEN
-                      UPDATE SET actual_geocode_lat = t.geocode_lat
-                          ,actual_geocode_long = t.geocode_long
-                          ,modified_date_geo = t.modified_dttm
-                      RETURNING
-                          to_jsonb(u) AS registro_json, merge_action(), u.resource_id
-              """)
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.resource_id} | Ação GEO realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-          except Exception as e:
-                    logger.error(f"[getGeoPos] Erro ao processar postgres: {e}")
-
-    return
-
-async def getLogInOut(r):
-    logger.warning("[getLogInOut] Entrou atualização Login...")
-
-    snapKey = f'snapLoginTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getLogInOutMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-
-              stmt = text(f"""
-                  MERGE INTO resources AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              person_id text, logged_in TIMESTAMP, logged_out TIMESTAMP, modified_dttm TIMESTAMP, last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_resource_id = t.person_id
-                  WHEN MATCHED AND (
-                                 u.logged_in IS DISTINCT FROM t.logged_in
-                              OR u.logged_out IS DISTINCT FROM t.logged_out
-                              ) AND u.modified_date_login < t.modified_dttm THEN
-                      UPDATE SET logged_in = t.logged_in
-                          ,logged_out = t.logged_out
-                          ,modified_date_login = t.modified_dttm
-                      RETURNING
-                          to_jsonb(u) AS registro_json, merge_action(), u.resource_id
-              """)
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"Registro: {row.resource_id} | Ação LOGIN realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getLogInOut] Erro ao processar postgres: {e}")
-
-    return
-
-async def getTeam(r):
-    logger.warning("[getTeam] Entrou atualização dos Times ...")
-
-    snapKey = f'snapTeamTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getTeamMatrix(dateTime, settings.client_uid)
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO teams AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              team_id text,
-                              description text,
-                              geocode_lat text,
-                              geocode_long text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_team_id = t.team_id
-                  WHEN MATCHED AND (
-                              u.team_name IS DISTINCT FROM t.description
-                              OR u.geocode_lat IS DISTINCT FROM t.geocode_lat
-                              OR u.geocode_long IS DISTINCT FROM t.geocode_long
-                              )  THEN
-                      UPDATE SET team_name = t.description
-                          ,geocode_lat = t.geocode_lat
-                          ,geocode_long = t.geocode_long
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  RETURNING
-                       u.team_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.team_id} | Ação TEAM realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getTeam] Erro ao processar postgres: {e}")
-
-    return
-
-async def getTeamMember(r):
-    logger.warning("[getTeamMember] Entrou atualização Team Member...")
-
-    snapKey = f'snapTeamMemberTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getTeamMemberMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-
-              stmt = text(f"""
-                  MERGE INTO team_members AS u
-                  USING (
-                      SELECT
-                          x.modified_dttm,
-                          tm.team_id,
-                          r.resource_id,
-                          x.last_snap,
-                          x.person_id
-                      FROM jsonb_to_recordset(:dados_json) AS x(
-                          modified_dttm TIMESTAMP,
-                          team_id text,
-                          person_id text,
-                          last_snap TIMESTAMP
-                      )
-                      JOIN teams tm ON tm.client_team_id = x.team_id and tm.client_id = :client_id
-                      JOIN resources r ON r.client_resource_id = x.person_id and r.client_id = :client_id
-                  ) AS t
-                  ON u.client_id = :client_id AND u.resource_id = t.resource_id AND u.team_id = t.team_id
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, team_id, resource_id, created_by,created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.team_id, t.resource_id, 'INTEGRATION', NOW(), 'INTEGRATION', t.modified_dttm)
-                  RETURNING
-                      to_jsonb(u) AS registro_json,
-                      merge_action(),
-                      u.uid;
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"UID: {row.uid} | Ação TEAM realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getTeamMember] Erro ao processar postgres: {e}")
-    return
-
-async def getJobType(r):
-    logger.warning("[getJobType] Entrou atualização de Tipos de Trabalho ...")
-
-    snapKey = f'snapJobTypeTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 2))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-
-    dateTime = oneHour(dateTime)
-
-    result_rows = await getJobTypeMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO job_types AS u
-                  USING (SELECT * FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              code_value text,
-                              description text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)) AS t
-                  ON u.client_id = :client_id AND u.client_job_type_id = t.code_value
-                  WHEN MATCHED AND ( u.description IS DISTINCT FROM t.description )
-                           THEN
-                      UPDATE SET description = t.description
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  RETURNING
-                      u.job_type_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.job_type_id} | Ação JOB_TYPE realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getJobType] Erro ao processar postgres: {e}")
-
-    return
-
-async def getJobStatus(r):
-    logger.warning("[getJobStatus] Entrou atualização de Status de Trabalho ...")
-
-    snapKey = f'snapJobStatusTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=365 * 7))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-    else:
-      dateTime = oneHour(dateTime)
-
-    result_rows = await getJobStatusMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-          last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-          try:
-              jsonResults = json.dumps(result_rows)
-              stmt = text(f"""
-                  MERGE INTO job_status AS u
-                  USING (SELECT x.*, s.style_id
-                          FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              task_status text,
-                              description text,
-                              item_style_id text,
-                              modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)
-                          JOIN styles s ON s.client_style_id = x.item_style_id AND s.client_id = :client_id
-                          ) AS t
-                  ON u.client_id = :client_id AND u.client_job_status_id = t.task_status
-                  WHEN MATCHED AND (
-                            u.description IS DISTINCT FROM t.description
-                          OR u.style_id IS DISTINCT FROM t.style_id)
-                           THEN
-                      UPDATE SET description = t.description
-                          ,style_id = t.style_id
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = t.modified_dttm
-                  RETURNING
-                      u.job_status_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.job_status_id} | Ação JOB_STATUS realizada: {row.merge_action}")
-
-              await r.set(snapKey, last_snap)
-
-          except Exception as e:
-                    logger.error(f"[getJobStatus] Erro ao processar postgres: {e}")
-
-    return
-
-async def getJobs(r):
-
-    logger.warning("[getJobs] Entrou atualização das Tarefas ...")
-
-    snapKey = f'snapJobsTime:{settings.client_uid}'
-    dateTime = await r.get(snapKey)
-    if dateTime is None:
-        tempDateTime = (datetime.now() - timedelta(days=5))
-        dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
-    else:
-      dateTime = oneHour(dateTime)
-
-    result_rows = await getJobsMatrix(dateTime, settings.client_uid)
-
-    if result_rows:
-      last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
-      first_snap = result_rows[0]['first_snap'][:19].replace('T', ' ')
-      try:
-          jsonResults = json.dumps(result_rows)
-          #Criação do Resource  
-          stmt = text(f"""
-                  MERGE INTO resources AS u
-                  USING (
-                      SELECT 
-                        DISTINCT x.* 
-                      FROM jsonb_to_recordset(:dados_json)
-                        AS x( person_id text,
-                                resource_name text,
-                                resource_geocode_lat text,
-                                resource_geocode_long text,
-                                geocode_lat_from text,
-                                geocode_long_from text,
-                                geocode_lat_at text,
-                                geocode_long_at text,
-                                work_status integer,
-                                resource_modified_dttm TIMESTAMP
-                            )
-                        WHERE person_id IS NOT NULL
-                      ) AS t
-                  ON u.client_id = :client_id AND u.client_resource_id = t.person_id
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_resource_id, description, fl_off_shift, actual_geocode_lat, actual_geocode_long, geocode_lat_from, geocode_long_from, geocode_lat_at, geocode_long_at, modified_date_geo, modified_date_login, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.person_id, t.resource_name, t.work_status, t.resource_geocode_lat, t.resource_geocode_long, t.geocode_lat_from, t.geocode_long_from, t.geocode_lat_at, t.geocode_long_at, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', 'INTEGRATION', NOW(), 'INTEGRATION', t.resource_modified_dttm)
-                  RETURNING
-                       u.resource_id, merge_action(), to_jsonb(u) AS registro_json
-                  """)
-          async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  setSnap = True
-                  logger.info(f"ID: {row.resource_id} | Ação RESOURCE realizada: {row.merge_action}")
-
-          # Criação do Team
-          setSnap = False
-          stmt = text(f"""
-                  MERGE INTO teams AS u
-                  USING (
-                      SELECT DISTINCT x.* FROM jsonb_to_recordset(:dados_json)
-                      AS x(   team_id text,
-                              desc_team text,
-                              team_modified_dttm TIMESTAMP
-                      ) ) AS t
-                  ON u.client_id = :client_id AND u.client_team_id = t.team_id
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_team_id, team_name, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.team_id, t.desc_team, 'INTEGRATION', NOW(), 'INTEGRATION', t.team_modified_dttm)
-                  RETURNING
-                       u.team_id, merge_action(), to_jsonb(u) AS registro_json
-                  """)
-          async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  setSnap = True
-                  logger.info(f"ID: {row.team_id} | Ação TEAM realizada: {row.merge_action}")
-
-          if setSnap:
-            snapKey = f'snapTeamTime:{settings.client_uid}'
-            await r.set(snapKey, first_snap)
-
-          # Criação do Job Types
-          setSnap = False
-          stmt = text(f"""
-                  MERGE INTO job_types AS u
-                  USING (
-                      SELECT DISTINCT x.* FROM jsonb_to_recordset(:dados_json)
-                      AS x(   task_type text,
-                              desc_task_type text,
-                              task_type_modified_dttm TIMESTAMP
-                      ) ) AS t
-                  ON u.client_id = :client_id AND u.client_job_type_id = t.task_type
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id,client_job_type_id, description, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.task_type, t.desc_task_type, 'INTEGRATION', NOW(), 'INTEGRATION', t.task_type_modified_dttm)
-                  RETURNING
-                       u.job_type_id, merge_action(), to_jsonb(u) AS registro_json
-                  """)
-          async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  setSnap = True
-                  logger.info(f"ID: {row.job_type_id} | Ação JOB TYPE realizada: {row.merge_action}")
-
-          if setSnap:
-            snapKey = f'snapJobTypeTime:{settings.client_uid}'
-            await r.set(snapKey, first_snap)
-
-          # Criação do Job Status
-          setSnap = False
-          stmt = text(f"""
-                  MERGE INTO job_status AS u
-                  USING (SELECT DISTINCT x.*, s.style_id
-                          FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              task_status text,
-                              desc_task_status text,
-                              item_style_id text,
-                              task_status_modified_dttm TIMESTAMP,
-                              last_snap TIMESTAMP)
-                          LEFT JOIN styles s ON x.item_style_id = s.client_style_id AND s.client_id = :client_id
-                          ) AS t
-                  ON u.client_id = :client_id AND u.client_job_status_id = t.task_status
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, client_job_status_id, style_id, description, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.task_status, t.style_id, t.desc_task_status, 'INTEGRATION', NOW(), 'INTEGRATION', t.task_status_modified_dttm)
-                  RETURNING
-                      u.job_status_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-          async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  setSnap = True
-                  logger.info(f"ID: {row.job_status_id} | Ação JOB STATUS realizada: {row.merge_action}")
-
-          if setSnap:
-            snapKey = f'snapJobStatusTime:{settings.client_uid}'
-            await r.set(snapKey, first_snap)
-
-          # Criação do Places
-          setSnap = False
-          stmt = text(f"""
-                  MERGE INTO places AS u
-                  USING (
-                      SELECT DISTINCT x.* FROM jsonb_to_recordset(:dados_json)
-                      AS x(   place_id text,
-                              trade_name text,
-                              cnpj text,
-                              place_modified_dttm TIMESTAMP
-                      ) ) AS t
-                  ON u.client_id = :client_id AND u.client_place_id = t.place_id
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, client_place_id, trade_name, cnpj, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.place_id, t.trade_name, t.cnpj, 'INTEGRATION', NOW(), 'INTEGRATION', t.place_modified_dttm)
-                  RETURNING
-                       u.place_id, merge_action(), to_jsonb(u) AS registro_json
-                  """)
-          async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  setSnap = True
-                  logger.info(f"ID: {row.place_id} | Ação PLACE realizada: {row.merge_action}")
-
-          if setSnap:
-            snapKey = f'snapPlaceTime:{settings.client_uid}'
-            await r.set(snapKey, first_snap)
-
-          #Criação do Address
-          setSnap = False
-          stmt = text(f"""
-              MERGE INTO address AS u
-              USING (SELECT DISTINCT x.*
-                      FROM jsonb_to_recordset(:dados_json)
-                        AS x(
-                          address_id text,
-                          address text,
-                          geocode_lat text,
-                          geocode_long text,
-                          city text,
-                          state_prov text,
-                          zippost text,
-                          address_modified_dttm TIMESTAMP,
-                          last_snap TIMESTAMP)) AS t
-              ON u.client_id = :client_id AND u.client_address_id = t.address_id
-              WHEN NOT MATCHED THEN
-                  INSERT (client_id, client_address_id, address, geocode_lat, geocode_long, city , state_prov, zippost, created_by, created_date, modified_by, modified_date)
-                  VALUES (:client_id, t.address_id, t.address, t.geocode_lat, t.geocode_long, t.city, t.state_prov, t.zippost, 'INTEGRATION', NOW(), 'INTEGRATION', t.address_modified_dttm)
-              RETURNING
-                  u.address_id, merge_action(), to_jsonb(u) AS registro_json
-          """)
-
-          async with SessionLocal() as db:
-            result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-            await db.commit()
-            for row in result:
-              # setSnap = True
-              logger.info(f"ID: {row.address_id} | Ação ADDRESS realizada: {row.merge_action}")
-
-          # if setSnap:
-          #   snapKey = f'snapAddressTime:{settings.client_uid}'
-          #   await r.set(snapKey, first_snap)
-
-           #Criação e atualização do Job
-          stmt = text(f"""
-              MERGE INTO jobs AS u
-              USING (SELECT x.*,
-                      CONCAT(x.request_id, '|', x.task_id) AS client_job_id,
-                      t.team_id AS team_idd,
-                      r.resource_id,
-                      a.address_id AS address_idd,
-                      p.place_id AS place_idd,
-                      jt.job_type_id,
-                      js.job_status_id,
-                      COALESCE(py.priority,0) AS priority
-
-                      FROM jsonb_to_recordset(:dados_json)
-                        AS x( request_id text,
-                              contr_type text,
-                              task_id text,
-                              team_id text,
-                              person_id text,
-                              address_id text,
-                              place_id text,
-                              task_type text,
-                              task_status text,
-                              created_dttm TIMESTAMP,
-                              modified_dttm TIMESTAMP,
-                              work_duration NUMERIC,
-                              plan_start_dttm TIMESTAMP,
-                              plan_end_dttm TIMESTAMP,
-                              actual_start_dttm TIMESTAMP,
-                              actual_end_dttm TIMESTAMP,
-                              sla TIMESTAMP,
-                              plan_task_dur_min integer,
-                              pp_person_id text,
-                              pp_actual_start_dttm TIMESTAMP,
-                              pp_actual_end_dttm TIMESTAMP,
-                              pt_task_id text,
-                              pt_actual_start_dttm TIMESTAMP,
-                              pt_actual_end_dttm TIMESTAMP,
-                              pt_geocode_lat text,
-                              pt_geocode_long text,
-                              last_snap TIMESTAMP)
-                      LEFT JOIN resources r ON x.person_id = r.client_resource_id AND :client_id = r.client_id
-                      JOIN teams t ON t.client_team_id = x.team_id AND t.client_id = :client_id
-                      join address a ON a.client_address_id = x.address_id AND a.client_id = :client_id
-                      JOIN job_types jt ON jt.client_job_type_id = x.task_type AND jt.client_id = :client_id
-                      JOIN job_status js ON js.client_job_status_id = x.task_status AND js.client_id = :client_id
-                      JOIN places p ON p.client_place_id = x.place_id AND p.client_id = :client_id
-                      LEFT JOIN priority py ON x.contr_type = py.client_priority_id AND :client_id = py.client_id
-                      ) AS t
-              ON u.client_id = :client_id AND u.client_job_id = t.client_job_id
-              WHEN MATCHED AND (
-                             u.team_id IS DISTINCT FROM t.team_idd
-                          OR u.resource_id IS DISTINCT FROM t.resource_id
-                          OR u.address_id IS DISTINCT FROM t.address_idd
-                          OR u.place_id IS DISTINCT FROM t.place_idd
-                          OR u.job_type_id IS DISTINCT FROM t.job_type_id
-                          OR u.job_status_id IS DISTINCT FROM t.job_status_id
-                          OR u.created_date IS DISTINCT FROM t.created_dttm
-                          OR u.work_duration IS DISTINCT FROM t.work_duration::INTEGER
-                          OR u.plan_start_date IS DISTINCT FROM t.plan_start_dttm
-                          OR u.plan_end_date IS DISTINCT FROM t.plan_end_dttm
-                          OR u.actual_start_date IS DISTINCT FROM t.actual_start_dttm
-                          OR u.actual_end_date IS DISTINCT FROM t.actual_end_dttm
-                          OR u.time_limit_end IS DISTINCT FROM t.sla
-                          OR u.time_limit_start IS DISTINCT FROM t.plan_start_dttm
-                          OR u.time_service IS DISTINCT FROM t.plan_task_dur_min
-                          OR u.pp_resource_id IS DISTINCT FROM t.pp_person_id
-                          OR u.pp_start_date IS DISTINCT FROM t.pp_actual_start_dttm
-                          OR u.pp_end_date IS DISTINCT FROM t.pp_actual_end_dttm
-                          OR u.pt_job_id IS DISTINCT FROM t.pt_task_id
-                          OR u.pt_start_date IS DISTINCT FROM t.pt_actual_start_dttm
-                          OR u.pt_end_date IS DISTINCT FROM t.pt_actual_end_dttm
-                          OR u.pt_geocode_lat IS DISTINCT FROM t.pt_geocode_lat
-                          OR u.pt_geocode_long IS DISTINCT FROM t.pt_geocode_long
-                          OR u.priority IS DISTINCT FROM t.priority
-                          ) THEN
-                  UPDATE SET team_id = t.team_idd
-                      ,resource_id = t.resource_id
-                      ,address_id = t.address_idd
-                      ,place_id = t.place_idd
-                      ,job_type_id = t.job_type_id
-                      ,job_status_id = t.job_status_id
-                      ,work_duration = t.work_duration::INTEGER
-                      ,plan_start_date = t.plan_start_dttm
-                      ,plan_end_date = t.plan_end_dttm
-                      ,actual_start_date = t.actual_start_dttm
-                      ,actual_end_date = t.actual_end_dttm
-                      ,time_limit_end = t.sla
-                      ,time_limit_start = t.plan_start_dttm
-                      ,time_service = t.plan_task_dur_min
-                      ,pp_resource_id = t.pp_person_id
-                      ,pp_start_date = t.pp_actual_start_dttm
-                      ,pp_end_date = t.pp_actual_end_dttm
-                      ,pt_job_id = t.pt_task_id
-                      ,pt_start_date = t.pt_actual_start_dttm
-                      ,pt_end_date = t.pt_actual_end_dttm
-                      ,pt_geocode_lat = t.pt_geocode_lat
-                      ,pt_geocode_long = t.pt_geocode_long
-                      ,priority = t.priority
-                      ,modified_date = t.modified_dttm
-              WHEN NOT MATCHED THEN
-                  INSERT (client_id, client_job_id, team_id, resource_id, address_id, place_id, job_type_id, job_status_id, work_duration, plan_start_date, plan_end_date, actual_start_date, actual_end_date, time_limit_end, time_limit_start, time_service, pp_resource_id, pp_start_date, pp_end_date, pt_job_id, pt_start_date, pt_end_date, pt_geocode_lat, pt_geocode_long, priority, created_by, created_date, modified_by, modified_date)
-                  VALUES (:client_id, t.client_job_id, t.team_idd, t.resource_id, t.address_idd, t.place_idd, t.job_type_id, t.job_status_id, t.work_duration::INTEGER, t.plan_start_dttm, t.plan_end_dttm, t.actual_start_dttm, t.actual_end_dttm, t.sla, t.plan_start_dttm, t.plan_task_dur_min, t.pp_person_id, t.pp_actual_start_dttm, t.pp_actual_end_dttm, t.pt_task_id, t.pt_actual_start_dttm, t.pt_actual_end_dttm, t.pt_geocode_lat, t.pt_geocode_long, t.priority, 'INTEGRATION', t.created_dttm, 'INTEGRATION', t.modified_dttm)
-              RETURNING
-                  to_jsonb(u) AS registro_json, merge_action(), u.job_id
-          """)
-
-          async with SessionLocal() as db:
-            result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-            await db.commit()
-            for row in result:
-                await nofifyWebSocket(r, 'job', row)
-
-          await r.set(snapKey, last_snap)
-      except Exception as e:
-                logger.error(f"[getJobs] Erro ao processar postgres: {e}")
-    return
-    
-async def getPriority(r):
-    logger.warning("[getPriority] Entrou atualização das Janelas de Recursos ...")
-
-
-    result_rows = await getPriorityMatrix()
-    if result_rows:
-          try:
-              jsonResults = json.dumps(result_rows)
-
-              stmt = text(f"""
-                  MERGE INTO priority AS u
-                  USING (SELECT
-                            x.*
-                          FROM jsonb_to_recordset(:dados_json)
-                            AS x(
-                              contr_type text,
-                              ranking integer) ) AS t
-                  ON u.client_id = :client_id AND u.client_priority_id = t.contr_type
-                  WHEN MATCHED AND (
-                              u.priority IS DISTINCT FROM t.ranking
-                              )  THEN
-                      UPDATE SET 
-                          priority = t.ranking
-                          ,modified_by = 'INTEGRATION'
-                          ,modified_date = NOW()
-                  WHEN NOT MATCHED THEN
-                      INSERT (client_id, client_priority_id, priority, created_by, created_date, modified_by, modified_date)
-                      VALUES (:client_id, t.contr_type, t.ranking, 'INTEGRATION', NOW(), 'INTEGRATION', NOW())
-                  RETURNING
-                       u.priority_id, merge_action(), to_jsonb(u) AS registro_json
-              """)
-
-              async with SessionLocal() as db:
-                result = await db.execute(stmt, {"dados_json": jsonResults, "client_id": settings.client_uid})
-                await db.commit()
-                for row in result:
-                  logger.info(f"ID: {row.priority_id} | Ação PRIORITY realizada: {row.merge_action}")
-
-
-          except Exception as e:
-                    logger.error(f"[getResourceWindow] Erro ao processar postgres: {e}")
-
-    return
-
 async def processo_em_background(r):
     SLEEP_NORMAL = 10
     SLEEP_MAX = 300
@@ -3316,32 +2075,6 @@ async def processo_em_background(r):
     try:
         while True:
             try:
-                await getStyle(r)
-                await asyncio.sleep(0.2)
-                await getResources(r)
-                await asyncio.sleep(0.2)
-                await getResourceWindow(r)
-                await asyncio.sleep(0.2)
-                await getGeoPos(r)
-                await asyncio.sleep(0.2)
-                await getLogInOut(r)
-                await asyncio.sleep(0.2)
-                await getJobs(r)
-                await asyncio.sleep(0.2)
-                await getTeam(r)
-                await asyncio.sleep(0.2)
-                await getTeamMember(r)
-                await asyncio.sleep(0.2)
-                await getAddress(r)
-                await asyncio.sleep(0.2)
-                await getPlaces(r)
-                await asyncio.sleep(0.2)
-                await getJobType(r)
-                await asyncio.sleep(0.2)
-                await getJobStatus(r)
-                await asyncio.sleep(0.2)
-                await calcDistance(r)
-                await asyncio.sleep(0.2)
                 await checkPendencias(r)
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
@@ -3369,6 +2102,7 @@ async def scheduled_process(r):
         while True:
             
             try:
+                await checkPendencias(r)
                 client_ids = []
                 async with SessionLocal() as db:
                     clients = await db.execute(text("SELECT client_id FROM clients"))
@@ -3411,28 +2145,15 @@ async def scheduled_process(r):
 
                 for clientId in client_ids:
                     while True:
-                        semaforo = json.loads(await r.get(f'semaforo:{clientId}'))
-                        calc_distance = semaforo['calc_distance'] 
-                        print(f"Semáforo para client_id {clientId}: calc_distance - {calc_distance}")
-                        if calc_distance == 'Y':
-                            tasks = asyncio.all_tasks()
-                            nomes_ativos = [task.get_name() for task in tasks]
-                            if f'buildReports:{clientId}' in nomes_ativos:
-                                logger.warning(f"buildReports já está em execução para client_id {clientId}. Aguardando para iniciar nova execução...")
-                                break
-                            
-                            # await r.set(f'buildReports:{clientId}', 'Y')
-                            logger.info(f"Iniciando buildReports para client_id {clientId}...")
-                            asyncio.create_task(buildReports(clientId=clientId, r=r),name=f'buildReports:{clientId}')
+                        tasks = asyncio.all_tasks()
+                        nomes_ativos = [task.get_name() for task in tasks]
+                        if f'buildReports:{clientId}' in nomes_ativos:
+                            logger.warning(f"buildReports já está em execução para client_id {clientId}. Aguardando para iniciar nova execução...")
                             break
-                        logger.warning(f"calc_distance ainda não está 'Y' para client_id {clientId}. Aguardando 5 segundos antes de verificar novamente...")
-                        await asyncio.sleep(5)
-
-
-
-
-                # await asyncio.sleep(0.5)
-                # await getPriority(r)
+                        
+                        # await r.set(f'buildReports:{clientId}', 'Y')
+                        logger.info(f"Iniciando buildReports para client_id {clientId}...")
+                        asyncio.create_task(buildReports(clientId=clientId, r=r),name=f'buildReports:{clientId}')
 
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
@@ -3517,7 +2238,7 @@ async def main():
 
     try:
         await asyncio.gather(
-            processo_em_background(r),
+            # processo_em_background(r),
             scheduled_process(r)
             # adicione outros workers aqui, ex: outro_processo(r),
         )

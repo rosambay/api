@@ -216,11 +216,23 @@ async def login(form_data: schemas.LoginRequest, request: Request, r: Redis = De
     session = str(uuid.uuid4())
     sessionKey = f"session:{session}"
 
-    rUserTeams = await db.execute(select(models.UserTeam).where(models.UserTeam.user_id == userDb.user_id, models.UserTeam.client_id == clientId))
+    stmt = text("""
+        with resources as(
+            select 
+                tm.team_id, 
+                json_agg(json_build_object('resource_id',tm.resource_id)) as list
+             FROM team_members tm
+              JOIN user_team ut ON ut.client_id = tm.client_id AND ut.team_id = tm.team_id
+             where tm.client_id = :client_id
+             AND ut.user_id = :user_id
+             group by tm.team_id
+        )
+        select  json_agg(json_build_object('team_id', team_id, 'resources',  list)) as res FROM resources
+    """)
+    resultDb = await db.execute(stmt,{"client_id":clientId, "user_id":userDb.user_id})
+    result = resultDb.scalars().first()
 
-    teams = [{"team_id": t.team_id, "user_id": t.user_id, "client_id": t.client_id} for t in rUserTeams.scalars().all()]
-
-    await r.setex(sessionKey, token_expiry, json.dumps(teams)),
+    await r.setex(sessionKey, token_expiry, json.dumps(result)),
     
     dataToken = {
         "userId": userDb.user_id,

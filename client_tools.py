@@ -431,7 +431,41 @@ def parse_xml_dataset(xml_response: str) -> tuple[List[str], List[Dict[str, Any]
         logger.error(f"[parse_xml_dataset] Traceback: {traceback.format_exc()}")
         return columns, rows
 
-async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
+
+async def getClientMatrix(dateTime: str = None, query: str = None):
+    try:
+        dateTime = _validate_datetime(dateTime)
+            # Cria cliente FSM
+        config = FSMConnectionConfig(
+            host=settings.url_fsm,
+            username=settings.usuario,
+            password=settings.senha,
+            target=FSMTarget.WCF
+        )
+        
+        client = FSMClient(config)
+       
+        param = query.format(dateTime=dateTime)
+        app_params_response = await client.execute_query(param)
+
+        await client.close()
+
+        if app_params_response.success:
+            logger.info(f"[getMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getMatrix] {severidade} : {mensagem}")
+            return False
+
+    except Exception as e:
+        logger.error(f"[getMatrix] Erro ao testar conexão: {e}")
+        return False
+    
+async def getJobsMatrix(dateTime: str = None, query: str = None):
     try:
         dateTime = _validate_datetime(dateTime)
             # Cria cliente FSM
@@ -445,73 +479,77 @@ async def getJobsMatrix(dateTime: str = None, client_uid: str = None):
         client = FSMClient(config)
 
 # Recuperando o valor
-
-        app_params_response = await client.execute_query(f"""
+        
+        param = query.format(dateTime=dateTime)
+        app_params_response = await client.execute_query(param)
+        # app_params_response = await client.execute_query(f"""
             
-                SELECT TOP 10
-                    CONCAT(t.request_id,'|',t.task_id) AS client_job_id,
-                    t.team_id client_team_id,
-                    t.desc_team,
-                    CONVERT(VARCHAR(19), CAST(t.team_modified_dttm AS DATETIME2), 120) team_modified_date,
-                    t.person_id AS client_resource_id,
-                    concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
-                    p.status client_resource_status_id,
-                    p.desc_status resource_desc_status,  
-                    CONVERT(VARCHAR(19), CAST(p.modified_dttm AS DATETIME2), 120) AS resource_modified_date,                                         
-                    t.task_status AS client_status_id, 
-                    case when mmd.message_text is null then t.desc_task_status else mmd.message_text end desc_status,
-                    t.item_style_id client_style_id, 
-                    CONVERT(VARCHAR(19), CAST(t.task_status_modified_dttm AS DATETIME2), 120) status_modified_date,
-                    t.task_type AS client_type_id,
-                    t.desc_task_type AS desc_type,
-                    CONVERT(VARCHAR(19), CAST(t.task_type_modified_dttm AS DATETIME2), 120) type_modified_date,
-                    t.place_id client_place_id,
-                    t.trade_name,
-                    t.cnpj,
-                    CONVERT(VARCHAR(19), CAST(t.place_modified_dttm AS DATETIME2), 120) place_modified_date,
-                    t.address_id client_address_id,
-                    t.address,
-                    t.city,
-                    t.state_prov state, 
-                    t.zippost zip_code,
-                    t.geocode_lat, 
-                    t.geocode_long,
-                    CONVERT(VARCHAR(19), CAST(t.address_modified_dttm AS DATETIME2), 120) address_modified_date,
-                    CONVERT(VARCHAR(19), CAST(t.plan_start_dttm AS DATETIME2), 120) plan_start_date,
-                    CONVERT(VARCHAR(19), CAST(t.plan_end_dttm AS DATETIME2), 120) plan_end_date,
-                    CONVERT(VARCHAR(19), CAST(t.actual_start_dttm AS DATETIME2), 120) actual_start_date,
-                    CONVERT(VARCHAR(19), CAST(t.actual_end_dttm AS DATETIME2), 120) actual_end_date,
-                    COALESCE(t.work_duration,0) * 60 AS real_time_service,
-                    COALESCE(t.plan_task_dur_min,0) * 60 AS plan_time_service,
-                    CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) limit_start_date,
-                    t.sla limit_end_date,
-                    t.contr_type as priority,
-                    CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) created_date, 
-                    CONVERT(VARCHAR(19), CAST(t.modified_dttm AS DATETIME2), 120) modified_date
+        #         SELECT TOP 2000
+        #             CONCAT(t.request_id,'|',t.task_id) AS client_job_id,
+        #             t.team_id client_team_id,
+        #             t.desc_team,
+        #             CONVERT(VARCHAR(19), CAST(t.team_modified_dttm AS DATETIME2), 120) team_modified_date,
+        #             t.person_id AS client_resource_id,
+        #             concat(p.first_name,COALESCE(p.middle_name,' '),p.last_name) AS resource_name,
+        #             p.status client_resource_status_id,
+        #             p.desc_status resource_desc_status,  
+        #             CONVERT(VARCHAR(19), CAST(p.modified_dttm AS DATETIME2), 120) AS resource_modified_date,                                         
+        #             t.task_status AS client_status_id, 
+        #             case when mmd.message_text is null then t.desc_task_status else mmd.message_text end desc_status,
+        #             t.item_style_id client_style_id, 
+        #             CONVERT(VARCHAR(19), CAST(t.task_status_modified_dttm AS DATETIME2), 120) status_modified_date,
+        #             t.task_type AS client_type_id,
+        #             t.desc_task_type AS desc_type,
+        #             CONVERT(VARCHAR(19), CAST(t.task_type_modified_dttm AS DATETIME2), 120) type_modified_date,
+        #             t.place_id client_place_id,
+        #             t.trade_name,
+        #             t.cnpj,
+        #             CONVERT(VARCHAR(19), CAST(t.place_modified_dttm AS DATETIME2), 120) place_modified_date,
+        #             t.address_id client_address_id,
+        #             t.address,
+        #             t.city,
+        #             t.state_prov state, 
+        #             t.zippost zip_code,
+        #             t.geocode_lat, 
+        #             t.geocode_long,
+        #             CONVERT(VARCHAR(19), CAST(t.address_modified_dttm AS DATETIME2), 120) address_modified_date,
+        #             CONVERT(VARCHAR(19), CAST(t.plan_start_dttm AS DATETIME2), 120) plan_start_date,
+        #             CONVERT(VARCHAR(19), CAST(t.plan_end_dttm AS DATETIME2), 120) plan_end_date,
+        #             CONVERT(VARCHAR(19), CAST(t.actual_start_dttm AS DATETIME2), 120) actual_start_date,
+        #             CONVERT(VARCHAR(19), CAST(t.actual_end_dttm AS DATETIME2), 120) actual_end_date,
+        #             COALESCE(t.work_duration,0) * 60 AS real_time_service,
+        #             COALESCE(t.plan_task_dur_min,0) * 60 AS plan_time_service,
+        #             CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) limit_start_date,
+        #             t.sla limit_end_date,
+        #             COALESCE(cp.ranking,0) as priority,
+        #             CONVERT(VARCHAR(19), CAST(t.created_dttm AS DATETIME2), 120) created_date, 
+        #             CONVERT(VARCHAR(19), CAST(t.modified_dttm AS DATETIME2), 120) modified_date
 
-                FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
-                    LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
-                    LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
-                    LEFT JOIN dbo.C_PRIORITY_VW cp ON t.person_id = p.person_id
-                                                         
-                SELECT 
-              contr_type, 
-              ranking 
-             FROM dbo.C_PRIORITY_VW
-			    WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
-                 ORDER BY t.modified_dttm ASC 
+        #         FROM dbo.c_task_routes_vw t WITH (NOEXPAND)
+        #             LEFT JOIN dbo.c_person_vw p WITH (NOEXPAND) ON t.person_id = p.person_id
+        #             LEFT JOIN metrix_message_def mmd ON t.desc_message_id = mmd.message_id AND locale_code = 'PT-BR' AND mmd.message_type = 'CODE'
+        #             LEFT JOIN dbo.C_PRIORITY_VW cp ON t.contr_type = cp.contr_type
+		# 	    WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
+        #          ORDER BY t.modified_dttm ASC 
             
-            """)
+        #     """)
         # WHERE t.modified_dttm >= CAST('{dateTime}' AS datetime)
         await client.close()
 
         if app_params_response.success:
-                logger.info(f"[getJobsMatrix] Template executado com sucesso")
-                result_cols, result_rows = parse_xml_dataset(app_params_response.response_xml)
-        return (result_rows)
-        
+            logger.info(f"[getJobsMatrix] Template executado com sucesso")
+            _, result_rows = parse_xml_dataset(app_params_response.response_xml)
+            return (result_rows)
+        else:
+            root = ET.fromstring(app_params_response.response_xml)
+            severidade = root.find('.//severity').text
+            mensagem = root.find('.//message').text
+            logger.error(f"[getJobsMatrix] {severidade} : {mensagem}")
+            return False
+
     except Exception as e:
         logger.error(f"[getJobsMatrix] Erro ao testar conexão: {e}")
+        return False
 
 async def getStyleMetrix(dateTime: str = None, client_uid: str = None):
     try:
@@ -606,7 +644,6 @@ async def getAdressMatrix(dateTime: str = None, client_uid: str = None):
                     CONVERT(VARCHAR(19), CAST(modified_dttm AS DATETIME2), 120) as modified_date
                 from C_ADDRESS_VW a WITH (NOEXPAND)
                 where a.modified_dttm >= CAST('{dateTime}' AS datetime)
-               order by a.modified_dttm ASC
             """)
         await client.close()
 

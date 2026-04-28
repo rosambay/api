@@ -6,14 +6,14 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 import json
 import httpx
-from client_tools import (
+from client_tools import (getClientMatrix,
     getJobStatusMatrix, getJobTypeMatrix, getPlaceMatrix, getPriorityMatrix, getResourceWindowMatrix,
     getStyleMetrix, getResourcesMatrix, getTeamMatrix, getJobsMatrix, getGeoPosMatrix,
     getTeamMemberMatrix, getLogInOutMatrix, getAdressMatrix
 )
 CLIENT_ID     = "e226eb56-da6a-4f16-af12-cf02c8ad7fa2"
 CLIENT_SECRET = "da57626b-15fa-445a-9528-d3a698579b16"
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8001"
 
 def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -36,6 +36,28 @@ async def getSnaps(token: str):
     
     return json.loads(resp.json())
 
+async def getQueries(token: str):
+    resp = httpx.get(f"{BASE_URL}/queries", timeout=None, headers=auth_headers(token))
+    
+    return resp.json()
+
+async def getMatrix(token: str, snaps: dict, type: str, query: str):
+
+    logger.warning(f"[{type}] Entrou atualização ...")
+
+    dateTime = snaps[f'{type}']
+    result_rows = await getClientMatrix(dateTime, query[f'{type}'])
+
+    if result_rows:
+      try:
+          resp = httpx.post(f"{BASE_URL}/{type}", timeout=None, json=result_rows, headers=auth_headers(token))
+          print(f"  Status: {resp.status_code}")
+          print(f"  Resposta: {resp.json()}")
+
+      except Exception as e:
+                logger.error(f"[{type}] Erro ao processar : {e}")
+    return
+
 async def getStyle(token: str, snaps: dict):
 
     logger.warning("[getStyle] Entrou atualização de estilos...")
@@ -46,7 +68,7 @@ async def getStyle(token: str, snaps: dict):
 
     if result_rows:
         try:
-            print(result_rows)
+            # print(result_rows)
             resp = httpx.post(f"{BASE_URL}/styles", timeout=None, json=result_rows, headers=auth_headers(token))
             print(f"  Status: {resp.status_code}")
             print(f"  Resposta: {resp.json()}")
@@ -55,19 +77,17 @@ async def getStyle(token: str, snaps: dict):
             logger.error(f"[getStyle] Erro ao processar : {e}")
     return
 
-async def getJobs(token: str, snaps: dict):
+async def getJobs(token: str, snaps: dict, query: str):
 
     logger.warning("[getJobs] Entrou atualização das Tarefas ...")
 
-    # tempDateTime = (datetime.now() - timedelta(days=5))
-    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
     dateTime = snaps['jobs']
-    result_rows = await getJobsMatrix(dateTime)
+    result_rows = await getJobsMatrix(dateTime, query['jobs'])
 
     if result_rows:
     #   last_snap = result_rows[0]['last_snap'][:19].replace('T', ' ')
       try:
-          print(result_rows)
+          
           resp = httpx.post(f"{BASE_URL}/jobs", timeout=None, json=result_rows, headers=auth_headers(token))
           print(f"  Status: {resp.status_code}")
           print(f"  Resposta: {resp.json()}")
@@ -87,7 +107,7 @@ async def getResources(token: str, snaps: dict):
 
     if result_rows:
       try:
-          print(result_rows)
+        #   print(result_rows)
           resp = httpx.post(f"{BASE_URL}/resources", timeout=None, json=result_rows, headers=auth_headers(token))
           print(f"  Status: {resp.status_code}")
           print(f"  Resposta: {resp.json()}")
@@ -261,8 +281,6 @@ async def getActualGeoPos(token: str, snaps: dict):
 
     logger.warning("[getActualGeoPos] Entrou atualização Geo Resource posicionamento...")
 
-    # tempDateTime = (datetime.now() - timedelta(days=5))
-    # dateTime = tempDateTime.strftime('%Y-%m-%d ') + '00:00:00'
     dateTime = snaps['actual_geopos']
     result_rows = await getGeoPosMatrix(dateTime)
 
@@ -301,6 +319,7 @@ async def background_process():
     SLEEP_NORMAL = 10
     SLEEP_MAX = 300
     consecutive_failures = 0
+    QUERIES = None
 
     try:
         while True:
@@ -308,34 +327,37 @@ async def background_process():
                 token = await get_token()
                 snaps = await getSnaps(token)
                 print(snaps, type(snaps))
-                await getPriority(token, snaps)
-                # await getStyle(token, snaps)
-                # await asyncio.sleep(0.5)
-                # await getResources(token, snaps)
+                if not QUERIES:
+                    QUERIES = await getQueries(token)
+                    print(QUERIES['jobs'])
+
+                await getMatrix(token, snaps, 'styles', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'resources', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'resource_windows', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'jobs', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'address', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'places', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'teams', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'team_members', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'job_types', QUERIES)
+                await asyncio.sleep(0.5)
+                await getMatrix(token, snaps, 'job_status', QUERIES)
+                
                 # await asyncio.sleep(0.5)
                 # await getLogInOut(token, snaps)
-                await asyncio.sleep(0.5)
-                await getActualGeoPos(token, snaps)
+                
                 # await asyncio.sleep(0.5)
-                # await getResourceWindows(token,snaps)
-                # await asyncio.sleep(0.5)
-                # await getJobs(token, snaps)
-                # await asyncio.sleep(0.5)
-                # await getAddress(token,snaps)
-                # await asyncio.sleep(0.5)
-                # await getPlaces(token,snaps)
+                # await getActualGeoPos(token, snaps)
+                
 
-                # await asyncio.sleep(0.5)
-                # await getTeams(token,snaps)
-
-                # await asyncio.sleep(0.5)
-                # await getTeamMembers(token,snaps)
-
-                # await asyncio.sleep(0.5)
-                # await getJobTypes(token,snaps)
-
-                # await asyncio.sleep(0.5)
-                # await getJobStatus(token,snaps)
                 if consecutive_failures > 0:
                     logger.info(f"Background job recuperada após {consecutive_failures} falha(s) consecutiva(s).")
                 consecutive_failures = 0
